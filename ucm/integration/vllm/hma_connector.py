@@ -1,6 +1,7 @@
 import copy
 import math
 import os
+import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Optional, Sequence, Tuple
 
@@ -29,6 +30,10 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+
+def _now_us() -> int:
+    return time.perf_counter_ns() // 1000
 
 
 @dataclass(frozen=True)
@@ -259,6 +264,11 @@ class FAWALoadTask:
     store: UcmKVStoreBaseV1
     task: Task
     key_count: int
+    bytes: int = 0
+    ptr_rows: int = 0
+    ptr_cols: int = 0
+    submit_us: float = 0.0
+    wait_us: float = 0.0
     anchor_vllm_block_ids: set[int] = field(default_factory=set)
 
 
@@ -266,10 +276,18 @@ class FAWALoadTask:
 class FAWADumpTask:
     """Outstanding FAWA dump task submitted to one backing store."""
 
+    request_ids: tuple[str, ...]
     label: str
     store: UcmKVStoreBaseV1
     task: Task
     key_count: int
+    bytes: int = 0
+    ptr_rows: int = 0
+    ptr_cols: int = 0
+    submit_us: float = 0.0
+    submit_start_us: float = 0.0
+    wait_us: float = 0.0
+    elapsed_since_submit_us: float = 0.0
 
 
 class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
@@ -303,6 +321,8 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
         self._init_group_metas()
         self.fa_store: Optional[UcmKVStoreBaseV1] = None
         self.wa_store: Optional[UcmKVStoreBaseV1] = None
+        self.fa_store_row_bytes = 0
+        self.wa_store_row_bytes = 0
         self.requests_meta: dict[str, FAWARequestMeta] = {}
         self.tp_dump_tasks: dict[tuple, list[FAWADumpTask]] = {}
 
@@ -452,6 +472,7 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
                 group_layouts,
                 self.fa_group_ids,
             )
+            self.fa_store_row_bytes = sum(tensor_size_list)
             gpu_kv_buffer_config = self._gpu_kv_buffer_config(
                 group_layouts,
                 self.fa_group_ids,
@@ -480,6 +501,7 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
                 group_layouts,
                 self.window_group_ids,
             )
+            self.wa_store_row_bytes = sum(tensor_size_list)
             gpu_kv_buffer_config = self._gpu_kv_buffer_config(
                 group_layouts,
                 self.window_group_ids,
@@ -968,13 +990,24 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
         """Submit one store load and retain block ids for failure reporting."""
 
         shard_indices = [0] * len(keys)
+        submit_start_time = _now_us()
         task = store.load_data(keys, shard_indices, ptrs)
+        submit_us = _now_us() - submit_start_time
+        bytes_per_row = (
+            self.fa_store_row_bytes if label == "FA" else self.wa_store_row_bytes
+        )
+        ptr_rows = int(ptrs.shape[0]) if ptrs.ndim > 0 else 0
+        ptr_cols = int(math.prod(ptrs.shape[1:])) if ptrs.ndim > 1 else int(ptrs.size)
         return FAWALoadTask(
             request_id=request_id,
             label=label,
             store=store,
             task=task,
             key_count=len(keys),
+            bytes=len(keys) * bytes_per_row,
+            ptr_rows=ptr_rows,
+            ptr_cols=ptr_cols,
+            submit_us=submit_us,
             anchor_vllm_block_ids=anchor_vllm_block_ids,
         )
 
@@ -984,14 +1017,29 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
     ) -> None:
         """Wait a load task and mark its anchor blocks invalid on failure."""
 
+        status = "ok"
+        wait_start_time = _now_us()
         try:
             load_task.store.wait(load_task.task)
         except Exception as e:
+            status = "error"
             logger.error(
                 f"request {load_task.request_id} wait FAWA load "
                 f"task label={load_task.label} error. {type(e).__name__}: {e}"
             )
             self._invalid_block_ids.update(load_task.anchor_vllm_block_ids)
+        finally:
+            load_task.wait_us = _now_us() - wait_start_time
+            logger.info(
+                f"FAWA profile load_task request_id={load_task.request_id} "
+                f"label={load_task.label} "
+                f"status={status} "
+                f"keys={load_task.key_count} "
+                f"bytes={load_task.bytes} "
+                f"ptr_shape=({load_task.ptr_rows},{load_task.ptr_cols}) "
+                f"submit_us={load_task.submit_us:.3f} "
+                f"wait_us={load_task.wait_us:.3f}"
+            )
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         res = self._invalid_block_ids
@@ -1000,6 +1048,7 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
 
     def _submit_dump_task(
         self,
+        request_ids: tuple[str, ...],
         label: str,
         store: UcmKVStoreBaseV1,
         keys: list[bytes],
@@ -1009,18 +1058,60 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
         """Submit one store dump for FA or WA rows."""
 
         shard_indices = [0] * len(keys)
+        submit_start_time = _now_us()
         task = store.dump_data(keys, shard_indices, ptrs, event_handle)
+        submit_us = _now_us() - submit_start_time
+        bytes_per_row = (
+            self.fa_store_row_bytes if label == "FA" else self.wa_store_row_bytes
+        )
+        ptr_rows = int(ptrs.shape[0]) if ptrs.ndim > 0 else 0
+        ptr_cols = int(math.prod(ptrs.shape[1:])) if ptrs.ndim > 1 else int(ptrs.size)
         return FAWADumpTask(
+            request_ids=request_ids,
             label=label,
             store=store,
             task=task,
             key_count=len(keys),
+            bytes=len(keys) * bytes_per_row,
+            ptr_rows=ptr_rows,
+            ptr_cols=ptr_cols,
+            submit_us=submit_us,
+            submit_start_us=submit_start_time,
         )
 
     def _wait_dump_task(self, dump_task: FAWADumpTask) -> None:
         """Wait for a previously submitted FAWA dump task."""
 
-        dump_task.store.wait(dump_task.task)
+        status = "ok"
+        wait_start_time = _now_us()
+        try:
+            dump_task.store.wait(dump_task.task)
+        except Exception as e:
+            status = "error"
+            logger.error(
+                f"wait FAWA store task label={dump_task.label} error. "
+                f"{type(e).__name__}: {e}"
+            )
+            raise
+        finally:
+            wait_end_time = _now_us()
+            dump_task.wait_us = wait_end_time - wait_start_time
+            dump_task.elapsed_since_submit_us = (
+                wait_end_time - dump_task.submit_start_us
+            )
+            logger.info(
+                f"FAWA profile store_task "
+                f"request_count={len(dump_task.request_ids)} "
+                f"request_ids={','.join(dump_task.request_ids)} "
+                f"label={dump_task.label} "
+                f"status={status} "
+                f"keys={dump_task.key_count} "
+                f"bytes={dump_task.bytes} "
+                f"ptr_shape=({dump_task.ptr_rows},{dump_task.ptr_cols}) "
+                f"submit_us={dump_task.submit_us:.3f} "
+                f"wait_us={dump_task.wait_us:.3f} "
+                f"elapsed_since_submit_us={dump_task.elapsed_since_submit_us:.3f}"
+            )
 
     def _extract_fa_ptr(self, store_keys, hash_start, hash_end, candidate_vllm_ids):
         """Build store pointer rows for full-attention cache segments."""
@@ -1221,6 +1312,7 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
                     self.tp_dump_tasks[dump_request_ids] = []
                 self.tp_dump_tasks[dump_request_ids].append(
                     self._submit_dump_task(
+                        dump_request_ids,
                         "FA",
                         self.fa_store,
                         fa_dump_keys,
@@ -1234,6 +1326,7 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
                     self.tp_dump_tasks[dump_request_ids] = []
                 self.tp_dump_tasks[dump_request_ids].append(
                     self._submit_dump_task(
+                        dump_request_ids,
                         "WA",
                         self.wa_store,
                         wa_dump_keys,

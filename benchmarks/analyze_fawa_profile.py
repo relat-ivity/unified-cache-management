@@ -1,0 +1,347 @@
+#!/usr/bin/env python3
+"""Analyze FAWA load/store timing records emitted by HMA connector logs."""
+
+from __future__ import annotations
+
+import argparse
+import glob
+import math
+import re
+from collections import defaultdict
+from pathlib import Path
+from typing import Iterable
+
+
+PROFILE_RE = re.compile(r"FAWA profile (?P<event>\w+) (?P<fields>.*)")
+FIELD_RE = re.compile(r"(?P<key>[A-Za-z_][A-Za-z0-9_]*)=(?P<value>\S+)")
+NUMERIC_RE = re.compile(r"^-?(?:\d+\.?\d*|\.\d+)$")
+
+
+def expand_paths(patterns: Iterable[str]) -> list[Path]:
+    paths: list[Path] = []
+    for pattern in patterns:
+        matches = glob.glob(pattern)
+        if matches:
+            paths.extend(Path(match) for match in matches)
+        else:
+            paths.append(Path(pattern))
+    return paths
+
+
+def parse_value(value: str) -> object:
+    if NUMERIC_RE.match(value):
+        number = float(value)
+        if number.is_integer() and "." not in value:
+            return int(number)
+        return number
+    return value
+
+
+def parse_logs(paths: Iterable[Path]) -> dict[str, list[dict[str, object]]]:
+    events: dict[str, list[dict[str, object]]] = defaultdict(list)
+    for path in paths:
+        with path.open("r", encoding="utf-8", errors="replace") as f:
+            for line_no, line in enumerate(f, 1):
+                match = PROFILE_RE.search(line)
+                if not match:
+                    continue
+                record: dict[str, object] = {
+                    "source": str(path),
+                    "line": line_no,
+                }
+                for field in FIELD_RE.finditer(match.group("fields")):
+                    record[field.group("key")] = parse_value(field.group("value"))
+                events[match.group("event")].append(record)
+    return events
+
+
+def values(records: list[dict[str, object]], key: str) -> list[float]:
+    vals: list[float] = []
+    for record in records:
+        value = record.get(key)
+        if isinstance(value, (int, float)):
+            vals.append(float(value))
+    return vals
+
+
+def time_values_ms(
+    records: list[dict[str, object]],
+    key_ms: str,
+    key_us: str | None = None,
+) -> list[float]:
+    if key_us is None:
+        key_us = key_ms.replace("_ms", "_us")
+    vals: list[float] = []
+    for record in records:
+        if isinstance(record.get(key_us), (int, float)):
+            vals.append(float(record[key_us]) / 1000)
+        elif isinstance(record.get(key_ms), (int, float)):
+            vals.append(float(record[key_ms]))
+    return vals
+
+
+def total(records: list[dict[str, object]], key: str) -> float:
+    return sum(values(records, key))
+
+
+def percentile(vals: list[float], pct: float) -> float:
+    if not vals:
+        return math.nan
+    vals = sorted(vals)
+    rank = (len(vals) - 1) * pct / 100
+    lo = math.floor(rank)
+    hi = math.ceil(rank)
+    if lo == hi:
+        return vals[lo]
+    return vals[lo] * (hi - rank) + vals[hi] * (rank - lo)
+
+
+def stats(vals: list[float]) -> dict[str, float]:
+    if not vals:
+        return {
+            "count": 0,
+            "sum": 0.0,
+            "mean": math.nan,
+            "p50": math.nan,
+            "p90": math.nan,
+            "p99": math.nan,
+            "min": math.nan,
+            "max": math.nan,
+        }
+    return {
+        "count": len(vals),
+        "sum": sum(vals),
+        "mean": sum(vals) / len(vals),
+        "p50": percentile(vals, 50),
+        "p90": percentile(vals, 90),
+        "p99": percentile(vals, 99),
+        "min": min(vals),
+        "max": max(vals),
+    }
+
+
+def gib_per_s(byte_count: float, duration_ms: float) -> float:
+    if duration_ms <= 0:
+        return math.nan
+    return byte_count / duration_ms / 1024 / 1024
+
+
+def summarize_operation(
+    events: dict[str, list[dict[str, object]]],
+    summary_event: str,
+    task_event: str,
+) -> dict[str, object]:
+    summaries = events.get(summary_event, [])
+    tasks = events.get(task_event, [])
+    summary_wall = time_values_ms(summaries, "wall_ms", "wall_us")
+    task_wait = time_values_ms(tasks, "wait_ms", "wait_us")
+    duration_values = summary_wall if summary_wall else task_wait
+    bytes_total = total(summaries, "bytes") if summaries else total(tasks, "bytes")
+    keys_total = total(summaries, "keys") if summaries else total(tasks, "keys")
+    duration_sum = sum(duration_values)
+
+    if summaries:
+        submit_sum_values = time_values_ms(
+            summaries, "submit_ms_sum", "submit_us_sum"
+        )
+        wait_sum_values = time_values_ms(summaries, "wait_ms_sum", "wait_us_sum")
+        fa_wait_values = time_values_ms(
+            summaries, "fa_wait_ms_sum", "fa_wait_us_sum"
+        )
+        wa_wait_values = time_values_ms(
+            summaries, "wa_wait_ms_sum", "wa_wait_us_sum"
+        )
+    else:
+        submit_sum_values = time_values_ms(tasks, "submit_ms", "submit_us")
+        wait_sum_values = task_wait
+        fa_wait_values = time_values_ms(
+            [task for task in tasks if task.get("label") == "FA"],
+            "wait_ms",
+            "wait_us",
+        )
+        wa_wait_values = time_values_ms(
+            [task for task in tasks if task.get("label") == "WA"],
+            "wait_ms",
+            "wait_us",
+        )
+
+    result: dict[str, object] = {
+        "summaries": len(summaries),
+        "tasks": len(tasks),
+        "duration_source": "summary_wall" if summaries else "task_wait",
+        "keys": keys_total,
+        "bytes": bytes_total,
+        "wall_ms": stats(duration_values),
+        "submit_ms_sum": stats(submit_sum_values),
+        "wait_ms_sum": stats(wait_sum_values),
+        "fa_wait_ms_sum": stats(fa_wait_values),
+        "wa_wait_ms_sum": stats(wa_wait_values),
+        "throughput_gib_s": gib_per_s(bytes_total, duration_sum),
+        "task_submit_ms": stats(time_values_ms(tasks, "submit_ms", "submit_us")),
+        "task_wait_ms": stats(task_wait),
+        "errors": sum(1 for task in tasks if task.get("status") == "error"),
+    }
+    if task_event == "store_task":
+        result["task_elapsed_since_submit_ms"] = stats(
+            time_values_ms(
+                tasks,
+                "elapsed_since_submit_ms",
+                "elapsed_since_submit_us",
+            )
+        )
+    return result
+
+
+def summarize_group(label: str, paths: list[Path]) -> dict[str, object]:
+    events = parse_logs(paths)
+    return {
+        "label": label,
+        "paths": [str(path) for path in paths],
+        "lookup": {
+            "records": len(events.get("lookup", [])),
+            "hash_ms": stats(
+                time_values_ms(events.get("lookup", []), "hash_ms", "hash_us")
+            ),
+            "lookup_ms": stats(
+                time_values_ms(events.get("lookup", []), "lookup_ms", "lookup_us")
+            ),
+            "external_hit_blocks": stats(
+                values(events.get("lookup", []), "external_hit_blocks")
+            ),
+        },
+        "load": summarize_operation(events, "load_summary", "load_task"),
+        "store": summarize_operation(events, "store_summary", "store_task"),
+    }
+
+
+def fmt_ms(value: float) -> str:
+    return "n/a" if math.isnan(value) else f"{value:.3f}"
+
+
+def fmt_num(value: float) -> str:
+    return "n/a" if math.isnan(value) else f"{value:.3f}"
+
+
+def print_operation(name: str, summary: dict[str, object]) -> None:
+    wall = summary["wall_ms"]
+    submit = summary["submit_ms_sum"]
+    wait = summary["wait_ms_sum"]
+    fa_wait = summary["fa_wait_ms_sum"]
+    wa_wait = summary["wa_wait_ms_sum"]
+    print(f"{name}:")
+    print(
+        f"  summaries: {summary['summaries']}, tasks: {summary['tasks']}, "
+        f"duration_source: {summary['duration_source']}"
+    )
+    print(f"  keys: {int(summary['keys'])}, bytes: {int(summary['bytes'])}")
+    print(
+        "  wall_ms: "
+        f"mean={fmt_ms(wall['mean'])}, p50={fmt_ms(wall['p50'])}, "
+        f"p90={fmt_ms(wall['p90'])}, p99={fmt_ms(wall['p99'])}, "
+        f"sum={fmt_ms(wall['sum'])}"
+    )
+    print(
+        "  submit/wait sum ms: "
+        f"submit_mean={fmt_ms(submit['mean'])}, "
+        f"wait_mean={fmt_ms(wait['mean'])}, "
+        f"fa_wait_mean={fmt_ms(fa_wait['mean'])}, "
+        f"wa_wait_mean={fmt_ms(wa_wait['mean'])}"
+    )
+    print(f"  throughput_gib_s: {fmt_num(summary['throughput_gib_s'])}")
+    print(f"  errors: {summary['errors']}")
+
+    task_wait = summary["task_wait_ms"]
+    print(
+        "  task_wait_ms: "
+        f"mean={fmt_ms(task_wait['mean'])}, p50={fmt_ms(task_wait['p50'])}, "
+        f"p90={fmt_ms(task_wait['p90'])}, p99={fmt_ms(task_wait['p99'])}"
+    )
+    elapsed = summary.get("task_elapsed_since_submit_ms")
+    if isinstance(elapsed, dict):
+        print(
+            "  task_elapsed_since_submit_ms: "
+            f"mean={fmt_ms(elapsed['mean'])}, p50={fmt_ms(elapsed['p50'])}, "
+            f"p90={fmt_ms(elapsed['p90'])}, p99={fmt_ms(elapsed['p99'])}"
+        )
+
+
+def print_summary(summary: dict[str, object]) -> None:
+    print(f"== {summary['label']} ==")
+    print(f"logs: {', '.join(summary['paths'])}")
+    lookup = summary["lookup"]
+    print(
+        "lookup: "
+        f"records={lookup['records']}, "
+        f"lookup_ms_mean={fmt_ms(lookup['lookup_ms']['mean'])}, "
+        f"external_hit_blocks_mean={fmt_num(lookup['external_hit_blocks']['mean'])}"
+    )
+    print_operation("load", summary["load"])
+    print_operation("store", summary["store"])
+
+
+def compare_metric(
+    baseline: dict[str, object],
+    candidate: dict[str, object],
+    op: str,
+    metric: str,
+) -> None:
+    base = baseline[op]["wall_ms"][metric]
+    cand = candidate[op]["wall_ms"][metric]
+    if math.isnan(base) or math.isnan(cand) or cand == 0:
+        print(f"{op}.{metric}: n/a")
+        return
+    speedup = base / cand
+    reduction = (base - cand) / base * 100 if base else math.nan
+    print(
+        f"{op}.{metric}: baseline={base:.3f} ms, "
+        f"candidate={cand:.3f} ms, speedup={speedup:.3f}x, "
+        f"reduction={reduction:.2f}%"
+    )
+
+
+def print_comparison(baseline: dict[str, object], candidate: dict[str, object]) -> None:
+    print("== comparison ==")
+    for op in ("load", "store"):
+        for metric in ("mean", "p50", "p90", "sum"):
+            compare_metric(baseline, candidate, op, metric)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Analyze FAWA profile records from vLLM/UCM logs."
+    )
+    parser.add_argument("logs", nargs="*", help="Log files or glob patterns.")
+    parser.add_argument(
+        "--baseline",
+        nargs="+",
+        help="Baseline log files or glob patterns for comparison.",
+    )
+    parser.add_argument(
+        "--candidate",
+        nargs="+",
+        help="Candidate log files or glob patterns for comparison.",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    if args.baseline or args.candidate:
+        if not args.baseline or not args.candidate:
+            raise SystemExit("--baseline and --candidate must be used together.")
+        baseline = summarize_group("baseline", expand_paths(args.baseline))
+        candidate = summarize_group("candidate", expand_paths(args.candidate))
+        print_summary(baseline)
+        print()
+        print_summary(candidate)
+        print()
+        print_comparison(baseline, candidate)
+        return
+
+    if not args.logs:
+        raise SystemExit("No log files provided.")
+    print_summary(summarize_group("logs", expand_paths(args.logs)))
+
+
+if __name__ == "__main__":
+    main()
