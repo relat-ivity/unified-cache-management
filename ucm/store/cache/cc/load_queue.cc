@@ -22,8 +22,29 @@
  * SOFTWARE.
  * */
 #include "load_queue.h"
+#include <chrono>
+#include <cstdint>
 #include "logger/logger.h"
 #include "thread/cpu_affinity.h"
+
+namespace {
+
+uint64_t NowUs()
+{
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+}
+
+size_t TensorBytesPerShard(const std::vector<size_t>& tensorSizes)
+{
+    size_t total = 0;
+    for (const auto size : tensorSizes) { total += size; }
+    return total;
+}
+
+}  // namespace
 
 namespace UC::CacheStore {
 
@@ -44,6 +65,7 @@ Status LoadQueue::Setup(const Config& config, TaskIdSet* failureSet, TransBuffer
     streamNumber_ = config.streamNumber;
     useGdr_ = config.useGdr;
     cpuAffinityCores_ = config.cpuAffinityCores;
+    transferProfile_ = {};
     waiting_.Setup(config.waitingQueueDepth);
     running_.Setup(config.runningQueueDepth);
     holder_.reserve(1024);
@@ -132,22 +154,51 @@ void LoadQueue::TransferOneTask(CopyStream& stream, ShardTask&& task)
         if (task.waiter) { task.waiter->Done(); }
         return;
     }
+    const auto bytesPerShard = TensorBytesPerShard(tensorSizes_);
+    auto logTransferProfile = [&](const char* status, uint64_t syncUs) {
+        if (!transferProfile_.active || transferProfile_.shards == 0) { return; }
+        const auto elapsedUs = NowUs() - transferProfile_.startUs;
+        UC_INFO_UNLIMITED(
+            "UCM transfer profile op=load direction=H2D task_id={} device_id={} use_gdr={} "
+            "shards={} bytes={} submit_us={} sync_us={} elapsed_us={} status={}",
+            transferProfile_.taskHandle, deviceId_, useGdr_ ? 1 : 0, transferProfile_.shards,
+            transferProfile_.bytes, transferProfile_.submitUs, syncUs, elapsedUs, status);
+        transferProfile_ = {};
+    };
     auto s = Status::OK();
     do {
         s = WaitBackendTaskReady(task);
-        if (s.Failure()) [[unlikely]] { break; }
+        if (s.Failure()) [[unlikely]] {
+            logTransferProfile("error", 0);
+            break;
+        }
+        if (!transferProfile_.active || transferProfile_.taskHandle != task.taskHandle) {
+            transferProfile_ = {};
+            transferProfile_.taskHandle = task.taskHandle;
+            transferProfile_.startUs = NowUs();
+            transferProfile_.active = true;
+        }
+        const auto submitStartUs = NowUs();
         s = HostToDeviceScatterAsync(stream.NextStream(), task.bufferHandle.Data(),
                                      task.shard.addrs.data());
+        const auto submitUs = NowUs() - submitStartUs;
         if (s.Failure()) [[unlikely]] {
+            logTransferProfile("error", 0);
             UC_ERROR("Failed({}) to do H2D batch async for task({}).", s, task.taskHandle);
             break;
         }
+        transferProfile_.submitUs += submitUs;
+        transferProfile_.shards += 1;
+        transferProfile_.bytes += bytesPerShard;
         if (!task.waiter) {
             holder_.push_back(std::move(task));
             return;
         }
+        const auto syncStartUs = NowUs();
         s = stream.Synchronize();
+        const auto syncUs = NowUs() - syncStartUs;
         holder_.clear();
+        logTransferProfile(s.Success() ? "ok" : "error", syncUs);
         if (s.Failure()) [[unlikely]] {
             UC_ERROR("Failed({}) to sync on stream for task({}).", s, task.taskHandle);
             break;

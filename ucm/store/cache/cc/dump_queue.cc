@@ -22,8 +22,29 @@
  * SOFTWARE.
  * */
 #include "dump_queue.h"
+#include <chrono>
+#include <cstdint>
 #include "logger/logger.h"
 #include "thread/cpu_affinity.h"
+
+namespace {
+
+uint64_t NowUs()
+{
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+}
+
+size_t TensorBytesPerShard(const std::vector<size_t>& tensorSizes)
+{
+    size_t total = 0;
+    for (const auto size : tensorSizes) { total += size; }
+    return total;
+}
+
+}  // namespace
 
 namespace UC::CacheStore {
 
@@ -98,6 +119,20 @@ Status DumpQueue::DumpOneTask(CopyStream& stream, TaskPtr task)
     UC_DEBUG("Try to dump ({}) shards.", nShard);
     DumpCtx dumpCtx;
     dumpCtx.taskHandle = task->id;
+    const auto bytesPerShard = TensorBytesPerShard(tensorSizes_);
+    uint64_t transferStartUs = 0;
+    uint64_t submitUs = 0;
+    size_t copiedShards = 0;
+    size_t copiedBytes = 0;
+    auto logTransferProfile = [&](const char* status, uint64_t syncUs) {
+        if (copiedShards == 0) { return; }
+        const auto elapsedUs = NowUs() - transferStartUs;
+        UC_INFO_UNLIMITED(
+            "UCM transfer profile op=dump direction=D2H task_id={} device_id={} use_gdr={} "
+            "shards={} bytes={} submit_us={} sync_us={} elapsed_us={} status={}",
+            task->id, deviceId_, useGdr_ ? 1 : 0, copiedShards, copiedBytes, submitUs, syncUs,
+            elapsedUs, status);
+    };
     if (task->desc.prerequisiteHandle != 0) {
         auto s = stream.WaitEvent(reinterpret_cast<void*>(task->desc.prerequisiteHandle));
         if (s.Failure()) [[unlikely]] {
@@ -110,19 +145,28 @@ Status DumpQueue::DumpOneTask(CopyStream& stream, TaskPtr task)
         auto handle = buffer_->Get(shard.owner, shard.index);
         if (!handle.Owner()) { continue; }
         if (!handle.Ready()) {
+            if (copiedShards == 0) { transferStartUs = NowUs(); }
+            const auto submitStartUs = NowUs();
             auto s =
                 DeviceToHostGatherAsync(stream.NextStream(), shard.addrs.data(), handle.Data());
+            submitUs += NowUs() - submitStartUs;
             if (s.Failure()) [[unlikely]] {
+                logTransferProfile("error", 0);
                 UC_ERROR("Failed({}) to do D2H batch async for task({}).", s, task->id);
                 return s;
             }
+            copiedShards += 1;
+            copiedBytes += bytesPerShard;
         }
         backendTaskDesc.push_back(Detail::Shard{shard.owner, shard.index, {handle.Data()}});
         dumpCtx.bufferHandles.push_back(std::move(handle));
     }
     auto tpMakeBuffer = NowTime::Now();
     if (backendTaskDesc.empty()) { return Status::OK(); }
+    const auto syncStartUs = NowUs();
     auto s = stream.Synchronize();
+    const auto syncUs = NowUs() - syncStartUs;
+    logTransferProfile(s.Success() ? "ok" : "error", syncUs);
     if (s.Failure()) [[unlikely]] {
         UC_ERROR("Failed({}) to sync on stream for task({}).", s, task->id);
         return s;

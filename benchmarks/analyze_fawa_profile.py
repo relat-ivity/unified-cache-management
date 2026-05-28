@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Analyze FAWA load/store timing records emitted by HMA connector logs."""
+"""Analyze UCM CacheStore transfer timing records from vLLM logs."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ from typing import Iterable
 
 
 PROFILE_RE = re.compile(r"FAWA profile (?P<event>\w+) (?P<fields>.*)")
+TRANSFER_RE = re.compile(r"UCM transfer profile (?P<fields>.*)")
 FIELD_RE = re.compile(r"(?P<key>[A-Za-z_][A-Za-z0-9_]*)=(?P<value>\S+)")
 NUMERIC_RE = re.compile(r"^-?(?:\d+\.?\d*|\.\d+)$")
 
@@ -42,16 +43,20 @@ def parse_logs(paths: Iterable[Path]) -> dict[str, list[dict[str, object]]]:
     for path in paths:
         with path.open("r", encoding="utf-8", errors="replace") as f:
             for line_no, line in enumerate(f, 1):
-                match = PROFILE_RE.search(line)
+                match = TRANSFER_RE.search(line)
+                event = "transfer"
                 if not match:
-                    continue
+                    match = PROFILE_RE.search(line)
+                    if not match:
+                        continue
+                    event = match.group("event")
                 record: dict[str, object] = {
                     "source": str(path),
                     "line": line_no,
                 }
                 for field in FIELD_RE.finditer(match.group("fields")):
                     record[field.group("key")] = parse_value(field.group("value"))
-                events[match.group("event")].append(record)
+                events[event].append(record)
     return events
 
 
@@ -192,10 +197,48 @@ def summarize_operation(
     return result
 
 
+def summarize_transfer_operation(
+    events: dict[str, list[dict[str, object]]],
+    op: str,
+) -> dict[str, object]:
+    records = [record for record in events.get("transfer", []) if record.get("op") == op]
+    elapsed = time_values_ms(records, "elapsed_ms", "elapsed_us")
+    submit = time_values_ms(records, "submit_ms", "submit_us")
+    sync = time_values_ms(records, "sync_ms", "sync_us")
+    bytes_total = total(records, "bytes")
+    return {
+        "summaries": 0,
+        "tasks": len(records),
+        "duration_source": "stream_elapsed",
+        "shards": total(records, "shards"),
+        "keys": total(records, "shards"),
+        "bytes": bytes_total,
+        "wall_ms": stats(elapsed),
+        "submit_ms_sum": stats(submit),
+        "wait_ms_sum": stats(sync),
+        "fa_wait_ms_sum": stats([]),
+        "wa_wait_ms_sum": stats([]),
+        "throughput_gib_s": gib_per_s(bytes_total, sum(elapsed)),
+        "task_submit_ms": stats(submit),
+        "task_wait_ms": stats(sync),
+        "task_elapsed_ms": stats(elapsed),
+        "errors": sum(1 for record in records if record.get("status") == "error"),
+    }
+
+
 def summarize_group(label: str, paths: list[Path]) -> dict[str, object]:
     events = parse_logs(paths)
+    if events.get("transfer"):
+        return {
+            "label": label,
+            "mode": "ucm_transfer",
+            "paths": [str(path) for path in paths],
+            "load": summarize_transfer_operation(events, "load"),
+            "store": summarize_transfer_operation(events, "dump"),
+        }
     return {
         "label": label,
+        "mode": "fawa_profile",
         "paths": [str(path) for path in paths],
         "lookup": {
             "records": len(events.get("lookup", [])),
@@ -241,29 +284,51 @@ def print_operation(name: str, summary: dict[str, object]) -> None:
         f"  summaries: {summary['summaries']}, tasks: {summary['tasks']}, "
         f"duration_source: {summary['duration_source']}"
     )
-    print(f"  keys: {int(summary['keys'])}, bytes: {int(summary['bytes'])}")
-    print(
-        "  wall_ms: "
-        f"mean={fmt_ms(wall['mean'])}, p50={fmt_ms(wall['p50'])}, "
-        f"p90={fmt_ms(wall['p90'])}, p99={fmt_ms(wall['p99'])}, "
-        f"sum={fmt_ms(wall['sum'])}"
-    )
-    print(
-        "  submit/wait sum ms: "
-        f"submit_mean={fmt_ms(submit['mean'])}, "
-        f"wait_mean={fmt_ms(wait['mean'])}, "
-        f"fa_wait_mean={fmt_ms(fa_wait['mean'])}, "
-        f"wa_wait_mean={fmt_ms(wa_wait['mean'])}"
-    )
+    if "shards" in summary:
+        print(f"  shards: {int(summary['shards'])}, bytes: {int(summary['bytes'])}")
+        print(
+            "  elapsed_ms: "
+            f"mean={fmt_ms(wall['mean'])}, p50={fmt_ms(wall['p50'])}, "
+            f"p90={fmt_ms(wall['p90'])}, p99={fmt_ms(wall['p99'])}, "
+            f"sum={fmt_ms(wall['sum'])}"
+        )
+        print(
+            "  submit/sync ms: "
+            f"submit_mean={fmt_ms(submit['mean'])}, "
+            f"sync_mean={fmt_ms(wait['mean'])}, sync_sum={fmt_ms(wait['sum'])}"
+        )
+    else:
+        print(f"  keys: {int(summary['keys'])}, bytes: {int(summary['bytes'])}")
+        print(
+            "  wall_ms: "
+            f"mean={fmt_ms(wall['mean'])}, p50={fmt_ms(wall['p50'])}, "
+            f"p90={fmt_ms(wall['p90'])}, p99={fmt_ms(wall['p99'])}, "
+            f"sum={fmt_ms(wall['sum'])}"
+        )
+        print(
+            "  submit/wait sum ms: "
+            f"submit_mean={fmt_ms(submit['mean'])}, "
+            f"wait_mean={fmt_ms(wait['mean'])}, "
+            f"fa_wait_mean={fmt_ms(fa_wait['mean'])}, "
+            f"wa_wait_mean={fmt_ms(wa_wait['mean'])}"
+        )
     print(f"  throughput_gib_s: {fmt_num(summary['throughput_gib_s'])}")
     print(f"  errors: {summary['errors']}")
 
     task_wait = summary["task_wait_ms"]
-    print(
-        "  task_wait_ms: "
-        f"mean={fmt_ms(task_wait['mean'])}, p50={fmt_ms(task_wait['p50'])}, "
-        f"p90={fmt_ms(task_wait['p90'])}, p99={fmt_ms(task_wait['p99'])}"
-    )
+    if "shards" in summary:
+        task_elapsed = summary["task_elapsed_ms"]
+        print(
+            "  task_elapsed_ms: "
+            f"mean={fmt_ms(task_elapsed['mean'])}, p50={fmt_ms(task_elapsed['p50'])}, "
+            f"p90={fmt_ms(task_elapsed['p90'])}, p99={fmt_ms(task_elapsed['p99'])}"
+        )
+    else:
+        print(
+            "  task_wait_ms: "
+            f"mean={fmt_ms(task_wait['mean'])}, p50={fmt_ms(task_wait['p50'])}, "
+            f"p90={fmt_ms(task_wait['p90'])}, p99={fmt_ms(task_wait['p99'])}"
+        )
     elapsed = summary.get("task_elapsed_since_submit_ms")
     if isinstance(elapsed, dict):
         print(
@@ -293,13 +358,15 @@ def print_transfer_totals(summary: dict[str, object]) -> None:
 def print_summary(summary: dict[str, object]) -> None:
     print(f"== {summary['label']} ==")
     print(f"logs: {', '.join(summary['paths'])}")
-    lookup = summary["lookup"]
-    print(
-        "lookup: "
-        f"records={lookup['records']}, "
-        f"lookup_ms_mean={fmt_ms(lookup['lookup_ms']['mean'])}, "
-        f"external_hit_blocks_mean={fmt_num(lookup['external_hit_blocks']['mean'])}"
-    )
+    print(f"mode: {summary['mode']}")
+    if summary["mode"] != "ucm_transfer":
+        lookup = summary["lookup"]
+        print(
+            "lookup: "
+            f"records={lookup['records']}, "
+            f"lookup_ms_mean={fmt_ms(lookup['lookup_ms']['mean'])}, "
+            f"external_hit_blocks_mean={fmt_num(lookup['external_hit_blocks']['mean'])}"
+        )
     print_operation("load", summary["load"])
     print_operation("dump/store", summary["store"])
     print_transfer_totals(summary)
@@ -330,24 +397,38 @@ def print_comparison(baseline: dict[str, object], candidate: dict[str, object]) 
     for op in ("load", "store"):
         for metric in ("mean", "p50", "p90", "sum"):
             compare_metric(baseline, candidate, op, metric)
-    print("transfer_total.sum:")
-    base_total = op_total_ms(baseline, "load") + op_total_ms(baseline, "store")
-    cand_total = op_total_ms(candidate, "load") + op_total_ms(candidate, "store")
-    if cand_total == 0:
-        print("  n/a")
-    else:
-        speedup = base_total / cand_total
-        reduction = (base_total - cand_total) / base_total * 100 if base_total else 0.0
-        print(
-            f"  baseline={base_total:.3f} ms, "
-            f"candidate={cand_total:.3f} ms, "
-            f"speedup={speedup:.3f}x, reduction={reduction:.2f}%"
-        )
 
+    base_load = op_total_ms(baseline, "load")
+    cand_load = op_total_ms(candidate, "load")
+    base_dump = op_total_ms(baseline, "store")
+    cand_dump = op_total_ms(candidate, "store")
+    print_total_comparison("load_total_ms", base_load, cand_load)
+    print_total_comparison("dump_total_ms", base_dump, cand_dump)
+    print_total_comparison(
+        "load_plus_dump_total_ms",
+        base_load + base_dump,
+        cand_load + cand_dump,
+    )
+
+
+def print_total_comparison(name: str, baseline_ms: float, candidate_ms: float) -> None:
+    print(f"{name}:")
+    if math.isnan(baseline_ms) or math.isnan(candidate_ms) or candidate_ms == 0:
+        print("  n/a")
+        return
+    speedup = baseline_ms / candidate_ms
+    reduction = (
+        (baseline_ms - candidate_ms) / baseline_ms * 100 if baseline_ms else 0.0
+    )
+    print(
+        f"  baseline={baseline_ms:.3f} ms, "
+        f"candidate={candidate_ms:.3f} ms, "
+        f"speedup={speedup:.3f}x, reduction={reduction:.2f}%"
+    )
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Analyze FAWA profile records from vLLM/UCM logs."
+        description="Analyze UCM transfer profile records from vLLM/UCM logs."
     )
     parser.add_argument("logs", nargs="*", help="Log files or glob patterns.")
     parser.add_argument(

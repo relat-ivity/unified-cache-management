@@ -24,6 +24,7 @@
 #ifndef UNIFIEDCACHE_CACHE_STORE_CC_LOAD_QUEUE_H
 #define UNIFIEDCACHE_CACHE_STORE_CC_LOAD_QUEUE_H
 
+#include <cstdint>
 #include <future>
 #include <thread>
 #include "copy_stream.h"
@@ -48,6 +49,14 @@ class LoadQueue {
         Detail::TaskHandle backendTaskHandle;
         WaiterPtr waiter;
     };
+    struct TransferProfile {
+        Detail::TaskHandle taskHandle{0};
+        uint64_t startUs{0};
+        uint64_t submitUs{0};
+        size_t shards{0};
+        size_t bytes{0};
+        bool active{false};
+    };
 
 private:
     alignas(64) std::atomic_bool stop_{false};
@@ -64,6 +73,7 @@ private:
     std::thread dispatcher_;
     std::thread transfer_;
     std::vector<ShardTask> holder_;
+    TransferProfile transferProfile_;
 
 public:
     ~LoadQueue();
