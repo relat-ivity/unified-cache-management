@@ -222,6 +222,14 @@ def fmt_num(value: float) -> str:
     return "n/a" if math.isnan(value) else f"{value:.3f}"
 
 
+def op_total_ms(summary: dict[str, object], op: str) -> float:
+    return float(summary[op]["wall_ms"]["sum"])
+
+
+def op_total_bytes(summary: dict[str, object], op: str) -> float:
+    return float(summary[op]["bytes"])
+
+
 def print_operation(name: str, summary: dict[str, object]) -> None:
     wall = summary["wall_ms"]
     submit = summary["submit_ms_sum"]
@@ -265,6 +273,23 @@ def print_operation(name: str, summary: dict[str, object]) -> None:
         )
 
 
+def print_transfer_totals(summary: dict[str, object]) -> None:
+    load_ms = op_total_ms(summary, "load")
+    dump_ms = op_total_ms(summary, "store")
+    total_ms = load_ms + dump_ms
+    load_bytes = op_total_bytes(summary, "load")
+    dump_bytes = op_total_bytes(summary, "store")
+    total_bytes = load_bytes + dump_bytes
+    print("transfer totals:")
+    print(f"  load_total_ms: {fmt_ms(load_ms)}")
+    print(f"  dump_total_ms: {fmt_ms(dump_ms)}")
+    print(f"  load_plus_dump_total_ms: {fmt_ms(total_ms)}")
+    print(f"  load_total_bytes: {int(load_bytes)}")
+    print(f"  dump_total_bytes: {int(dump_bytes)}")
+    print(f"  load_plus_dump_total_bytes: {int(total_bytes)}")
+    print(f"  load_plus_dump_gib_s: {fmt_num(gib_per_s(total_bytes, total_ms))}")
+
+
 def print_summary(summary: dict[str, object]) -> None:
     print(f"== {summary['label']} ==")
     print(f"logs: {', '.join(summary['paths'])}")
@@ -276,7 +301,8 @@ def print_summary(summary: dict[str, object]) -> None:
         f"external_hit_blocks_mean={fmt_num(lookup['external_hit_blocks']['mean'])}"
     )
     print_operation("load", summary["load"])
-    print_operation("store", summary["store"])
+    print_operation("dump/store", summary["store"])
+    print_transfer_totals(summary)
 
 
 def compare_metric(
@@ -304,6 +330,19 @@ def print_comparison(baseline: dict[str, object], candidate: dict[str, object]) 
     for op in ("load", "store"):
         for metric in ("mean", "p50", "p90", "sum"):
             compare_metric(baseline, candidate, op, metric)
+    print("transfer_total.sum:")
+    base_total = op_total_ms(baseline, "load") + op_total_ms(baseline, "store")
+    cand_total = op_total_ms(candidate, "load") + op_total_ms(candidate, "store")
+    if cand_total == 0:
+        print("  n/a")
+    else:
+        speedup = base_total / cand_total
+        reduction = (base_total - cand_total) / base_total * 100 if base_total else 0.0
+        print(
+            f"  baseline={base_total:.3f} ms, "
+            f"candidate={cand_total:.3f} ms, "
+            f"speedup={speedup:.3f}x, reduction={reduction:.2f}%"
+        )
 
 
 def parse_args() -> argparse.Namespace:
