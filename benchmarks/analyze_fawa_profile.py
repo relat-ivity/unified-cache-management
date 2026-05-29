@@ -14,6 +14,7 @@ from typing import Iterable
 
 PROFILE_RE = re.compile(r"FAWA profile (?P<event>\w+) (?P<fields>.*)")
 TRANSFER_RE = re.compile(r"UCM transfer profile (?P<fields>.*)")
+SEGMENT_RE = re.compile(r"UCM (?P<direction>H2D|D2H) segment (?P<fields>.*)")
 FIELD_RE = re.compile(r"(?P<key>[A-Za-z_][A-Za-z0-9_]*)=(?P<value>\S+)")
 NUMERIC_RE = re.compile(r"^-?(?:\d+\.?\d*|\.\d+)$")
 
@@ -46,19 +47,25 @@ def parse_logs(paths: Iterable[Path]) -> dict[str, list[dict[str, object]]]:
                 match = TRANSFER_RE.search(line)
                 event = "transfer"
                 if not match:
-                    match = PROFILE_RE.search(line)
-                    if not match:
-                        continue
-                    event = match.group("event")
+                    match = SEGMENT_RE.search(line)
+                    if match:
+                        event = "segment"
+                    else:
+                        match = PROFILE_RE.search(line)
+                        if not match:
+                            continue
+                        event = match.group("event")
                 record: dict[str, object] = {
                     "source": str(path),
                     "line": line_no,
                 }
+                if event == "segment":
+                    record["direction"] = match.group("direction")
+                    record["op"] = "load" if record["direction"] == "H2D" else "dump"
                 for field in FIELD_RE.finditer(match.group("fields")):
                     record[field.group("key")] = parse_value(field.group("value"))
                 events[event].append(record)
     return events
-
 
 def values(records: list[dict[str, object]], key: str) -> list[float]:
     vals: list[float] = []
@@ -226,6 +233,38 @@ def summarize_transfer_operation(
     }
 
 
+def summarize_segments(
+    events: dict[str, list[dict[str, object]]],
+) -> dict[str, list[dict[str, object]]]:
+    grouped: dict[str, dict[int, list[float]]] = {
+        "H2D": defaultdict(list),
+        "D2H": defaultdict(list),
+    }
+    for record in events.get("segment", []):
+        direction = record.get("direction")
+        size = record.get("bytes")
+        submit_us = record.get("submit_us")
+        if direction not in grouped:
+            continue
+        if not isinstance(size, (int, float)) or not isinstance(submit_us, (int, float)):
+            continue
+        grouped[str(direction)][int(size)].append(float(submit_us) / 1000)
+
+    result: dict[str, list[dict[str, object]]] = {}
+    for direction, by_size in grouped.items():
+        rows: list[dict[str, object]] = []
+        for size, submit_ms in sorted(by_size.items()):
+            rows.append(
+                {
+                    "bytes": size,
+                    "count": len(submit_ms),
+                    "submit_ms": stats(submit_ms),
+                }
+            )
+        result[direction] = rows
+    return result
+
+
 def summarize_group(label: str, paths: list[Path]) -> dict[str, object]:
     events = parse_logs(paths)
     if events.get("transfer"):
@@ -235,6 +274,7 @@ def summarize_group(label: str, paths: list[Path]) -> dict[str, object]:
             "paths": [str(path) for path in paths],
             "load": summarize_transfer_operation(events, "load"),
             "store": summarize_transfer_operation(events, "dump"),
+            "segments": summarize_segments(events),
         }
     return {
         "label": label,
@@ -254,6 +294,7 @@ def summarize_group(label: str, paths: list[Path]) -> dict[str, object]:
         },
         "load": summarize_operation(events, "load_summary", "load_task"),
         "store": summarize_operation(events, "store_summary", "store_task"),
+        "segments": summarize_segments(events),
     }
 
 
@@ -355,6 +396,29 @@ def print_transfer_totals(summary: dict[str, object]) -> None:
     print(f"  load_plus_dump_gib_s: {fmt_num(gib_per_s(total_bytes, total_ms))}")
 
 
+def print_segments(summary: dict[str, object]) -> None:
+    segments = summary.get("segments")
+    if not isinstance(segments, dict):
+        return
+    if not any(segments.get(direction) for direction in ("H2D", "D2H")):
+        return
+
+    print("segment submit by size:")
+    for direction in ("H2D", "D2H"):
+        rows = segments.get(direction, [])
+        if not rows:
+            continue
+        print(f"  {direction}:")
+        for row in rows:
+            submit = row["submit_ms"]
+            print(
+                f"    bytes={int(row['bytes'])}, count={int(row['count'])}, "
+                f"submit_mean_ms={fmt_ms(submit['mean'])}, "
+                f"submit_p50_ms={fmt_ms(submit['p50'])}, "
+                f"submit_p90_ms={fmt_ms(submit['p90'])}"
+            )
+
+
 def print_summary(summary: dict[str, object]) -> None:
     print(f"== {summary['label']} ==")
     print(f"logs: {', '.join(summary['paths'])}")
@@ -370,6 +434,7 @@ def print_summary(summary: dict[str, object]) -> None:
     print_operation("load", summary["load"])
     print_operation("dump/store", summary["store"])
     print_transfer_totals(summary)
+    print_segments(summary)
 
 
 def compare_metric(
