@@ -36,6 +36,10 @@ def _now_us() -> int:
     return time.perf_counter_ns() // 1000
 
 
+def _epoch_us() -> int:
+    return time.time_ns() // 1000
+
+
 @dataclass(frozen=True)
 class KVCacheGroupMeta:
     """Logical storage shape for one vLLM KV-cache group."""
@@ -1094,17 +1098,20 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         start_load_kv_start_us = _now_us()
+        start_load_kv_epoch_start_us = _epoch_us()
         metadata = self._get_connector_metadata()
         if not isinstance(metadata, UCMFAWAConnectorMetadata):
             raise RuntimeError(f"Unexpected FAWA metadata type: {type(metadata)}")
 
         tasks: list[FAWALoadTask] = []
         load_requests = 0
+        load_request_ids: list[str] = []
         has_error = False
         for request_id, request in metadata.request_meta.items():
             if not request.load_keys:
                 continue
             load_requests += 1
+            load_request_ids.append(str(request_id))
             group0_vllm_block_ids = set(request.load_vllm_block_ids[0])
             try:
                 if self.fa_store is None:
@@ -1161,12 +1168,16 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
             return
 
         start_load_kv_wall_us = _now_us() - start_load_kv_start_us
+        start_load_kv_epoch_end_us = _epoch_us()
         start_load_kv_status = "error" if has_error else "ok"
         logger.info(
             f"FAWA connector start_load_kv profile "
             f"tp_rank={self.tp_rank} local_rank={self.local_rank} "
             f"requests={len(metadata.request_meta)} "
             f"load_requests={load_requests} "
+            f"request_ids={','.join(sorted(load_request_ids))} "
+            f"start_us={start_load_kv_epoch_start_us} "
+            f"end_us={start_load_kv_epoch_end_us} "
             f"tasks={len(tasks)} wall_us={start_load_kv_wall_us} "
             f"status={start_load_kv_status}"
         )

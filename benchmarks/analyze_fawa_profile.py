@@ -121,8 +121,34 @@ def total(records: list[dict[str, object]], key: str) -> float:
     return sum(values(records, key))
 
 
+def cross_rank_durations_ms(records: list[dict[str, object]]) -> tuple[list[float], list[int]]:
+    by_request_ids: dict[str, list[dict[str, object]]] = {}
+    for record in records:
+        request_ids = record.get("request_ids")
+        if not isinstance(request_ids, str) or not request_ids:
+            continue
+        by_request_ids.setdefault(request_ids, []).append(record)
+
+    durations_ms: list[float] = []
+    rank_counts: list[int] = []
+    for group in by_request_ids.values():
+        starts = values(group, "start_us")
+        ends = values(group, "end_us")
+        if not starts or not ends:
+            continue
+        ranks = {
+            record.get("local_rank", record.get("tp_rank"))
+            for record in group
+            if record.get("local_rank", record.get("tp_rank")) is not None
+        }
+        durations_ms.append((max(ends) - min(starts)) / 1000)
+        rank_counts.append(len(ranks) if ranks else len(group))
+    return durations_ms, rank_counts
+
+
 def summarize_group(label: str, paths: list[Path]) -> dict[str, object]:
     records = parse_logs(paths)
+    cross_rank_ms, cross_rank_counts = cross_rank_durations_ms(records)
     return {
         "label": label,
         "paths": [str(path) for path in paths],
@@ -131,6 +157,9 @@ def summarize_group(label: str, paths: list[Path]) -> dict[str, object]:
         "load_requests": total(records, "load_requests"),
         "tasks": total(records, "tasks"),
         "wall_ms": stats(time_values_ms(records, "wall_ms", "wall_us")),
+        "cross_rank_groups": len(cross_rank_ms),
+        "cross_rank_ranks": stats([float(count) for count in cross_rank_counts]),
+        "cross_rank_wall_ms": stats(cross_rank_ms),
         "errors": sum(1 for record in records if record.get("status") == "error"),
     }
 
@@ -141,6 +170,8 @@ def fmt_ms(value: float) -> str:
 
 def print_summary(summary: dict[str, object]) -> None:
     wall = summary["wall_ms"]
+    cross_rank_wall = summary["cross_rank_wall_ms"]
+    cross_rank_ranks = summary["cross_rank_ranks"]
     print(f"== {summary['label']} ==")
     print(f"logs: {', '.join(summary['paths'])}")
     print("start_load_kv:")
@@ -157,6 +188,22 @@ def print_summary(summary: dict[str, object]) -> None:
         f"p90={fmt_ms(wall['p90'])}, p99={fmt_ms(wall['p99'])}, "
         f"sum={fmt_ms(wall['sum'])}"
     )
+    if summary["cross_rank_groups"]:
+        print("cross_rank_start_load_kv:")
+        print(
+            f"  groups: {summary['cross_rank_groups']}, "
+            f"ranks_mean={cross_rank_ranks['mean']:.3f}, "
+            f"ranks_min={cross_rank_ranks['min']:.0f}, "
+            f"ranks_max={cross_rank_ranks['max']:.0f}"
+        )
+        print(
+            "  wall_ms: "
+            f"mean={fmt_ms(cross_rank_wall['mean'])}, "
+            f"p50={fmt_ms(cross_rank_wall['p50'])}, "
+            f"p90={fmt_ms(cross_rank_wall['p90'])}, "
+            f"p99={fmt_ms(cross_rank_wall['p99'])}, "
+            f"sum={fmt_ms(cross_rank_wall['sum'])}"
+        )
 
 
 def print_comparison(baseline: dict[str, object], candidate: dict[str, object]) -> None:
@@ -176,6 +223,23 @@ def print_comparison(baseline: dict[str, object], candidate: dict[str, object]) 
             f"candidate={cand:.3f} ms, speedup={speedup:.3f}x, "
             f"reduction={reduction:.2f}%"
         )
+
+    base_cross = baseline["cross_rank_wall_ms"]
+    cand_cross = candidate["cross_rank_wall_ms"]
+    if base_cross["count"] or cand_cross["count"]:
+        for metric in ("mean", "p50", "p90", "sum"):
+            base = base_cross[metric]
+            cand = cand_cross[metric]
+            if math.isnan(base) or math.isnan(cand) or cand == 0:
+                print(f"cross_rank_start_load_kv_wall.{metric}: n/a")
+                continue
+            speedup = base / cand
+            reduction = (base - cand) / base * 100 if base else math.nan
+            print(
+                f"cross_rank_start_load_kv_wall.{metric}: "
+                f"baseline={base:.3f} ms, candidate={cand:.3f} ms, "
+                f"speedup={speedup:.3f}x, reduction={reduction:.2f}%"
+            )
 
 
 def parse_args() -> argparse.Namespace:
