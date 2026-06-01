@@ -13,8 +13,11 @@ from typing import Iterable
 
 
 PROFILE_RE = re.compile(r"FAWA profile (?P<event>\w+) (?P<fields>.*)")
+CONNECTOR_LOAD_PROFILE_RE = re.compile(
+    r"FAWA connector load profile (?P<fields>.*)"
+)
+CONNECTOR_LOAD_TASK_RE = re.compile(r"FAWA connector load task (?P<fields>.*)")
 TRANSFER_RE = re.compile(r"UCM transfer profile (?P<fields>.*)")
-SEGMENT_RE = re.compile(r"UCM (?P<direction>H2D|D2H) segment (?P<fields>.*)")
 FIELD_RE = re.compile(r"(?P<key>[A-Za-z_][A-Za-z0-9_]*)=(?P<value>\S+)")
 NUMERIC_RE = re.compile(r"^-?(?:\d+\.?\d*|\.\d+)$")
 
@@ -47,21 +50,22 @@ def parse_logs(paths: Iterable[Path]) -> dict[str, list[dict[str, object]]]:
                 match = TRANSFER_RE.search(line)
                 event = "transfer"
                 if not match:
-                    match = SEGMENT_RE.search(line)
+                    match = CONNECTOR_LOAD_PROFILE_RE.search(line)
                     if match:
-                        event = "segment"
+                        event = "connector_load"
                     else:
-                        match = PROFILE_RE.search(line)
-                        if not match:
-                            continue
-                        event = match.group("event")
+                        match = CONNECTOR_LOAD_TASK_RE.search(line)
+                        if match:
+                            event = "connector_load_task"
+                        else:
+                            match = PROFILE_RE.search(line)
+                            if not match:
+                                continue
+                            event = match.group("event")
                 record: dict[str, object] = {
                     "source": str(path),
                     "line": line_no,
                 }
-                if event == "segment":
-                    record["direction"] = match.group("direction")
-                    record["op"] = "load" if record["direction"] == "H2D" else "dump"
                 for field in FIELD_RE.finditer(match.group("fields")):
                     record[field.group("key")] = parse_value(field.group("value"))
                 events[event].append(record)
@@ -233,36 +237,96 @@ def summarize_transfer_operation(
     }
 
 
-def summarize_segments(
+def summarize_connector_load(
     events: dict[str, list[dict[str, object]]],
-) -> dict[str, list[dict[str, object]]]:
-    grouped: dict[str, dict[int, list[float]]] = {
-        "H2D": defaultdict(list),
-        "D2H": defaultdict(list),
-    }
-    for record in events.get("segment", []):
-        direction = record.get("direction")
-        size = record.get("bytes")
-        submit_us = record.get("submit_us")
-        if direction not in grouped:
+) -> dict[str, object]:
+    profiles = events.get("connector_load", [])
+    tasks = events.get("connector_load_task", [])
+    load_elapsed_by_task: dict[tuple[int, int], list[float]] = defaultdict(list)
+    for record in events.get("transfer", []):
+        if record.get("op") != "load":
             continue
-        if not isinstance(size, (int, float)) or not isinstance(submit_us, (int, float)):
+        device_id = record.get("device_id")
+        task_id = record.get("task_id")
+        elapsed_us = record.get("elapsed_us")
+        elapsed_ms = record.get("elapsed_ms")
+        if not isinstance(device_id, (int, float)):
             continue
-        grouped[str(direction)][int(size)].append(float(submit_us) / 1000)
+        if not isinstance(task_id, (int, float)):
+            continue
+        if isinstance(elapsed_us, (int, float)):
+            elapsed = float(elapsed_us) / 1000
+        elif isinstance(elapsed_ms, (int, float)):
+            elapsed = float(elapsed_ms)
+        else:
+            continue
+        load_elapsed_by_task[(int(device_id), int(task_id))].append(elapsed)
 
-    result: dict[str, list[dict[str, object]]] = {}
-    for direction, by_size in grouped.items():
-        rows: list[dict[str, object]] = []
-        for size, submit_ms in sorted(by_size.items()):
-            rows.append(
-                {
-                    "bytes": size,
-                    "count": len(submit_ms),
-                    "submit_ms": stats(submit_ms),
-                }
+    tasks_by_request_rank: dict[tuple[object, object], list[dict[str, object]]] = (
+        defaultdict(list)
+    )
+    for task in tasks:
+        tasks_by_request_rank[(task.get("request_id"), task.get("local_rank"))].append(
+            task
+        )
+
+    cache_max_elapsed_ms: list[float] = []
+    rough_overhead_ms: list[float] = []
+    for profile in profiles:
+        wall_us = profile.get("wall_us")
+        wall_ms = profile.get("wall_ms")
+        if isinstance(wall_us, (int, float)):
+            connector_wall_ms = float(wall_us) / 1000
+        elif isinstance(wall_ms, (int, float)):
+            connector_wall_ms = float(wall_ms)
+        else:
+            continue
+
+        cache_elapsed: list[float] = []
+        for task in tasks_by_request_rank.get(
+            (profile.get("request_id"), profile.get("local_rank")),
+            [],
+        ):
+            local_rank = task.get("local_rank")
+            task_id = task.get("task_id")
+            if not isinstance(local_rank, (int, float)):
+                continue
+            if not isinstance(task_id, (int, float)):
+                continue
+            elapsed = load_elapsed_by_task.get((int(local_rank), int(task_id)), [])
+            if elapsed:
+                cache_elapsed.append(max(elapsed))
+        if not cache_elapsed:
+            continue
+        cache_max = max(cache_elapsed)
+        cache_max_elapsed_ms.append(cache_max)
+        rough_overhead_ms.append(connector_wall_ms - cache_max)
+
+    return {
+        "profiles": len(profiles),
+        "tasks": len(tasks),
+        "fa_keys": total(profiles, "fa_keys"),
+        "wa_keys": total(profiles, "wa_keys"),
+        "wall_ms": stats(time_values_ms(profiles, "wall_ms", "wall_us")),
+        "extract_ms": stats(time_values_ms(profiles, "extract_ms", "extract_us")),
+        "submit_ms": stats(time_values_ms(profiles, "submit_ms", "submit_us")),
+        "wait_ms": stats(time_values_ms(profiles, "wait_ms", "wait_us")),
+        "task_submit_ms": stats(time_values_ms(tasks, "submit_ms", "submit_us")),
+        "task_wait_ms": stats(time_values_ms(tasks, "wait_ms", "wait_us")),
+        "task_elapsed_since_submit_ms": stats(
+            time_values_ms(
+                tasks,
+                "elapsed_since_submit_ms",
+                "elapsed_since_submit_us",
             )
-        result[direction] = rows
-    return result
+        ),
+        "cache_max_elapsed_ms": stats(cache_max_elapsed_ms),
+        "rough_overhead_ms": stats(rough_overhead_ms),
+        "errors": (
+            sum(1 for profile in profiles if profile.get("status") == "error")
+            + sum(1 for task in tasks if task.get("status") == "error")
+        ),
+    }
 
 
 def summarize_group(label: str, paths: list[Path]) -> dict[str, object]:
@@ -274,7 +338,7 @@ def summarize_group(label: str, paths: list[Path]) -> dict[str, object]:
             "paths": [str(path) for path in paths],
             "load": summarize_transfer_operation(events, "load"),
             "store": summarize_transfer_operation(events, "dump"),
-            "segments": summarize_segments(events),
+            "connector_load": summarize_connector_load(events),
         }
     return {
         "label": label,
@@ -294,7 +358,7 @@ def summarize_group(label: str, paths: list[Path]) -> dict[str, object]:
         },
         "load": summarize_operation(events, "load_summary", "load_task"),
         "store": summarize_operation(events, "store_summary", "store_task"),
-        "segments": summarize_segments(events),
+        "connector_load": summarize_connector_load(events),
     }
 
 
@@ -396,27 +460,55 @@ def print_transfer_totals(summary: dict[str, object]) -> None:
     print(f"  load_plus_dump_gib_s: {fmt_num(gib_per_s(total_bytes, total_ms))}")
 
 
-def print_segments(summary: dict[str, object]) -> None:
-    segments = summary.get("segments")
-    if not isinstance(segments, dict):
+def print_connector_load(summary: dict[str, object]) -> None:
+    connector = summary.get("connector_load")
+    if not isinstance(connector, dict):
         return
-    if not any(segments.get(direction) for direction in ("H2D", "D2H")):
+    if not connector.get("profiles") and not connector.get("tasks"):
         return
 
-    print("segment submit by size:")
-    for direction in ("H2D", "D2H"):
-        rows = segments.get(direction, [])
-        if not rows:
-            continue
-        print(f"  {direction}:")
-        for row in rows:
-            submit = row["submit_ms"]
-            print(
-                f"    bytes={int(row['bytes'])}, count={int(row['count'])}, "
-                f"submit_mean_ms={fmt_ms(submit['mean'])}, "
-                f"submit_p50_ms={fmt_ms(submit['p50'])}, "
-                f"submit_p90_ms={fmt_ms(submit['p90'])}"
-            )
+    wall = connector["wall_ms"]
+    extract = connector["extract_ms"]
+    submit = connector["submit_ms"]
+    wait = connector["wait_ms"]
+    task_submit = connector["task_submit_ms"]
+    task_wait = connector["task_wait_ms"]
+    task_elapsed = connector["task_elapsed_since_submit_ms"]
+    cache_max = connector["cache_max_elapsed_ms"]
+    rough_overhead = connector["rough_overhead_ms"]
+    print("connector load:")
+    print(
+        f"  profiles: {connector['profiles']}, tasks: {connector['tasks']}, "
+        f"fa_keys: {int(connector['fa_keys'])}, "
+        f"wa_keys: {int(connector['wa_keys'])}, errors: {connector['errors']}"
+    )
+    print(
+        "  wall_ms: "
+        f"mean={fmt_ms(wall['mean'])}, p50={fmt_ms(wall['p50'])}, "
+        f"p90={fmt_ms(wall['p90'])}, p99={fmt_ms(wall['p99'])}, "
+        f"sum={fmt_ms(wall['sum'])}"
+    )
+    print(
+        "  extract/submit/wait ms: "
+        f"extract_mean={fmt_ms(extract['mean'])}, "
+        f"submit_mean={fmt_ms(submit['mean'])}, "
+        f"wait_mean={fmt_ms(wait['mean'])}, wait_sum={fmt_ms(wait['sum'])}"
+    )
+    print(
+        "  task submit/wait/elapsed ms: "
+        f"submit_mean={fmt_ms(task_submit['mean'])}, "
+        f"wait_mean={fmt_ms(task_wait['mean'])}, "
+        f"elapsed_mean={fmt_ms(task_elapsed['mean'])}, "
+        f"elapsed_p99={fmt_ms(task_elapsed['p99'])}"
+    )
+    if cache_max["count"]:
+        print(
+            "  rough overhead ms: "
+            f"cache_max_elapsed_mean={fmt_ms(cache_max['mean'])}, "
+            f"overhead_mean={fmt_ms(rough_overhead['mean'])}, "
+            f"overhead_p50={fmt_ms(rough_overhead['p50'])}, "
+            f"overhead_p90={fmt_ms(rough_overhead['p90'])}"
+        )
 
 
 def print_summary(summary: dict[str, object]) -> None:
@@ -434,7 +526,7 @@ def print_summary(summary: dict[str, object]) -> None:
     print_operation("load", summary["load"])
     print_operation("dump/store", summary["store"])
     print_transfer_totals(summary)
-    print_segments(summary)
+    print_connector_load(summary)
 
 
 def compare_metric(
@@ -463,6 +555,8 @@ def print_comparison(baseline: dict[str, object], candidate: dict[str, object]) 
         for metric in ("mean", "p50", "p90", "sum"):
             compare_metric(baseline, candidate, op, metric)
 
+    compare_connector_load(baseline, candidate)
+
     base_load = op_total_ms(baseline, "load")
     cand_load = op_total_ms(candidate, "load")
     base_dump = op_total_ms(baseline, "store")
@@ -474,6 +568,39 @@ def print_comparison(baseline: dict[str, object], candidate: dict[str, object]) 
         base_load + base_dump,
         cand_load + cand_dump,
     )
+
+
+def compare_connector_load(
+    baseline: dict[str, object],
+    candidate: dict[str, object],
+) -> None:
+    base_connector = baseline.get("connector_load")
+    cand_connector = candidate.get("connector_load")
+    if not isinstance(base_connector, dict) or not isinstance(cand_connector, dict):
+        return
+    if not base_connector.get("profiles") and not cand_connector.get("profiles"):
+        return
+
+    for stat_name, label in (
+        ("wall_ms", "connector_load_wall"),
+        ("extract_ms", "connector_extract"),
+        ("submit_ms", "connector_submit"),
+        ("wait_ms", "connector_wait"),
+        ("rough_overhead_ms", "connector_rough_overhead"),
+    ):
+        for metric in ("mean", "p50", "p90", "sum"):
+            base = base_connector[stat_name][metric]
+            cand = cand_connector[stat_name][metric]
+            if math.isnan(base) or math.isnan(cand) or cand == 0:
+                print(f"{label}.{metric}: n/a")
+                continue
+            speedup = base / cand
+            reduction = (base - cand) / base * 100 if base else math.nan
+            print(
+                f"{label}.{metric}: baseline={base:.3f} ms, "
+                f"candidate={cand:.3f} ms, speedup={speedup:.3f}x, "
+                f"reduction={reduction:.2f}%"
+            )
 
 
 def print_total_comparison(name: str, baseline_ms: float, candidate_ms: float) -> None:

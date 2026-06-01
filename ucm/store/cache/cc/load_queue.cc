@@ -235,10 +235,7 @@ Status LoadQueue::HostToDeviceScatterAsync(std::shared_ptr<Trans::Stream> stream
         auto pHost = (void*)(((int8_t*)host) + offset);
         auto pDevice = device[i];
         auto size = tensorSizes_[i];
-        const auto submitStartUs = NowUs();
         auto s = stream->HostToDeviceAsync(pHost, pDevice, size);
-        const auto submitUs = NowUs() - submitStartUs;
-        UC_INFO_UNLIMITED("UCM H2D segment bytes={} submit_us={}", size, submitUs);
         if (s.Failure()) [[unlikely]] {
             UC_ERROR("Failed({}) to do H2D({}) batch({}/{}) async.", s, size, i, number);
             return s;

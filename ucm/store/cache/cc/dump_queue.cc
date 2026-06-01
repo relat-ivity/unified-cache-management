@@ -195,10 +195,7 @@ Status DumpQueue::DeviceToHostGatherAsync(std::shared_ptr<Trans::Stream> stream,
         auto pDevice = device[i];
         auto pHost = (void*)(((int8_t*)host) + offset);
         auto size = tensorSizes_[i];
-        const auto submitStartUs = NowUs();
         auto s = stream->DeviceToHostAsync(pDevice, pHost, size);
-        const auto submitUs = NowUs() - submitStartUs;
-        UC_INFO_UNLIMITED("UCM D2H segment bytes={} submit_us={}", size, submitUs);
         if (s.Failure()) [[unlikely]] {
             UC_ERROR("Failed({}) to do D2H({}) batch({}/{}) async.", s, size, i, number);
             return s;

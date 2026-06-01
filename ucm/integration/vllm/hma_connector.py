@@ -1,6 +1,7 @@
 import copy
 import math
 import os
+import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Optional, Sequence, Tuple
 
@@ -29,6 +30,10 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+
+def _now_us() -> int:
+    return time.perf_counter_ns() // 1000
 
 
 @dataclass(frozen=True)
@@ -260,6 +265,13 @@ class FAWALoadTask:
     task: Task
     key_count: int
     anchor_vllm_block_ids: set[int] = field(default_factory=set)
+    task_id: object = None
+    submit_start_us: int = 0
+    submit_us: int = 0
+    wait_us: int = 0
+    wait_end_us: int = 0
+    elapsed_since_submit_us: int = 0
+    status: str = "submitted"
 
 
 @dataclass
@@ -968,7 +980,9 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
         """Submit one store load and retain block ids for failure reporting."""
 
         shard_indices = [0] * len(keys)
+        submit_start_us = _now_us()
         task = store.load_data(keys, shard_indices, ptrs)
+        submit_us = _now_us() - submit_start_us
         return FAWALoadTask(
             request_id=request_id,
             label=label,
@@ -976,6 +990,9 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
             task=task,
             key_count=len(keys),
             anchor_vllm_block_ids=anchor_vllm_block_ids,
+            task_id=getattr(task, "task_id", None),
+            submit_start_us=submit_start_us,
+            submit_us=submit_us,
         )
 
     def _wait_load_task(
@@ -984,14 +1001,40 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
     ) -> None:
         """Wait a load task and mark its anchor blocks invalid on failure."""
 
+        wait_start_us = _now_us()
         try:
             load_task.store.wait(load_task.task)
+            load_task.status = "ok"
         except Exception as e:
+            load_task.status = "error"
             logger.error(
                 f"request {load_task.request_id} wait FAWA load "
                 f"task label={load_task.label} error. {type(e).__name__}: {e}"
             )
             self._invalid_block_ids.update(load_task.anchor_vllm_block_ids)
+        finally:
+            wait_end_us = _now_us()
+            load_task.wait_end_us = wait_end_us
+            load_task.wait_us = wait_end_us - wait_start_us
+            load_task.elapsed_since_submit_us = (
+                wait_end_us - load_task.submit_start_us
+                if load_task.submit_start_us
+                else 0
+            )
+            task_id = (
+                load_task.task_id
+                if load_task.task_id is not None
+                else "n/a"
+            )
+            logger.info(
+                f"FAWA connector load task request_id={load_task.request_id} "
+                f"tp_rank={self.tp_rank} local_rank={self.local_rank} "
+                f"label={load_task.label} task_id={task_id} "
+                f"keys={load_task.key_count} submit_us={load_task.submit_us} "
+                f"wait_us={load_task.wait_us} "
+                f"elapsed_since_submit_us={load_task.elapsed_since_submit_us} "
+                f"status={load_task.status}"
+            )
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         res = self._invalid_block_ids
@@ -1093,10 +1136,23 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
             raise RuntimeError(f"Unexpected FAWA metadata type: {type(metadata)}")
 
         tasks: list[FAWALoadTask] = []
+        load_profiles: dict[str, dict[str, object]] = {}
         for request_id, request in metadata.request_meta.items():
             if not request.load_keys:
                 continue
             group0_vllm_block_ids = set(request.load_vllm_block_ids[0])
+            profile_start_us = _now_us()
+            load_profiles[request_id] = {
+                "start_us": profile_start_us,
+                "end_us": profile_start_us,
+                "extract_us": 0,
+                "submit_us": 0,
+                "wait_us": 0,
+                "fa_keys": 0,
+                "wa_keys": 0,
+                "tasks": 0,
+                "status": "ok",
+            }
             try:
                 if self.fa_store is None:
                     raise RuntimeError("FA store is not initialized.")
@@ -1104,40 +1160,68 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
                     raise RuntimeError("WA store is not initialized.")
 
                 # FA groups are loaded for every external-hit canonical block.
+                extract_start_us = _now_us()
                 fa_ptrs = self._extract_fa_ptr(
                     request.load_keys,
                     request.load_hash_start,
                     request.load_hash_end,
                     request.load_vllm_block_ids,
                 )
-                tasks.append(
-                    self._submit_load_task(
-                        request_id,
-                        "FA",
-                        self.fa_store,
-                        request.load_keys,
-                        fa_ptrs,
-                        group0_vllm_block_ids,
-                    )
+                load_profiles[request_id]["extract_us"] = (
+                    int(load_profiles[request_id]["extract_us"])
+                    + _now_us()
+                    - extract_start_us
+                )
+                fa_task = self._submit_load_task(
+                    request_id,
+                    "FA",
+                    self.fa_store,
+                    request.load_keys,
+                    fa_ptrs,
+                    group0_vllm_block_ids,
+                )
+                tasks.append(fa_task)
+                load_profiles[request_id]["submit_us"] = (
+                    int(load_profiles[request_id]["submit_us"])
+                    + fa_task.submit_us
+                )
+                load_profiles[request_id]["fa_keys"] = len(request.load_keys)
+                load_profiles[request_id]["tasks"] = (
+                    int(load_profiles[request_id]["tasks"]) + 1
                 )
 
                 # WA groups only need the final matched boundary.
                 window_keys = request.load_keys[-1:]
+                extract_start_us = _now_us()
                 window_ptrs = self._extract_wa_ptr(
                     window_keys,
                     request.load_vllm_block_ids,
                 )
-                tasks.append(
-                    self._submit_load_task(
-                        request_id,
-                        "WA",
-                        self.wa_store,
-                        window_keys,
-                        window_ptrs,
-                        group0_vllm_block_ids,
-                    )
+                load_profiles[request_id]["extract_us"] = (
+                    int(load_profiles[request_id]["extract_us"])
+                    + _now_us()
+                    - extract_start_us
+                )
+                wa_task = self._submit_load_task(
+                    request_id,
+                    "WA",
+                    self.wa_store,
+                    window_keys,
+                    window_ptrs,
+                    group0_vllm_block_ids,
+                )
+                tasks.append(wa_task)
+                load_profiles[request_id]["submit_us"] = (
+                    int(load_profiles[request_id]["submit_us"])
+                    + wa_task.submit_us
+                )
+                load_profiles[request_id]["wa_keys"] = len(window_keys)
+                load_profiles[request_id]["tasks"] = (
+                    int(load_profiles[request_id]["tasks"]) + 1
                 )
             except Exception as e:
+                load_profiles[request_id]["status"] = "error"
+                load_profiles[request_id]["end_us"] = _now_us()
                 logger.error(
                     f"request {request_id} submit FAWA load task "
                     f"error. {type(e).__name__}: {e}"
@@ -1146,6 +1230,29 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
 
         for load_task in tasks:
             self._wait_load_task(load_task)
+            profile = load_profiles.get(load_task.request_id)
+            if profile is None:
+                continue
+            profile["wait_us"] = int(profile["wait_us"]) + load_task.wait_us
+            profile["end_us"] = load_task.wait_end_us
+            if load_task.status != "ok":
+                profile["status"] = "error"
+
+        for request_id, profile in load_profiles.items():
+            start_us = int(profile["start_us"])
+            end_us = int(profile["end_us"])
+            wall_us = max(0, end_us - start_us)
+            logger.info(
+                f"FAWA connector load profile request_id={request_id} "
+                f"tp_rank={self.tp_rank} local_rank={self.local_rank} "
+                f"extract_us={int(profile['extract_us'])} "
+                f"submit_us={int(profile['submit_us'])} "
+                f"wait_us={int(profile['wait_us'])} wall_us={wall_us} "
+                f"fa_keys={int(profile['fa_keys'])} "
+                f"wa_keys={int(profile['wa_keys'])} "
+                f"tasks={int(profile['tasks'])} "
+                f"status={profile['status']}"
+            )
 
     def wait_for_save(self) -> None:
         metadata = self._get_connector_metadata()
