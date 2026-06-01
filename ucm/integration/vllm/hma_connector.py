@@ -1131,6 +1131,7 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
         return np.concatenate(all_ptrs, axis=1)
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
+        start_load_kv_start_us = _now_us()
         metadata = self._get_connector_metadata()
         if not isinstance(metadata, UCMFAWAConnectorMetadata):
             raise RuntimeError(f"Unexpected FAWA metadata type: {type(metadata)}")
@@ -1253,6 +1254,21 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
                 f"tasks={int(profile['tasks'])} "
                 f"status={profile['status']}"
             )
+
+        start_load_kv_wall_us = _now_us() - start_load_kv_start_us
+        start_load_kv_status = (
+            "error"
+            if any(profile["status"] != "ok" for profile in load_profiles.values())
+            else "ok"
+        )
+        logger.info(
+            f"FAWA connector start_load_kv profile "
+            f"tp_rank={self.tp_rank} local_rank={self.local_rank} "
+            f"requests={len(metadata.request_meta)} "
+            f"load_requests={len(load_profiles)} "
+            f"tasks={len(tasks)} wall_us={start_load_kv_wall_us} "
+            f"status={start_load_kv_status}"
+        )
 
     def wait_for_save(self) -> None:
         metadata = self._get_connector_metadata()

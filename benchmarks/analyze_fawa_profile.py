@@ -17,6 +17,9 @@ CONNECTOR_LOAD_PROFILE_RE = re.compile(
     r"FAWA connector load profile (?P<fields>.*)"
 )
 CONNECTOR_LOAD_TASK_RE = re.compile(r"FAWA connector load task (?P<fields>.*)")
+START_LOAD_KV_PROFILE_RE = re.compile(
+    r"FAWA connector start_load_kv profile (?P<fields>.*)"
+)
 TRANSFER_RE = re.compile(r"UCM transfer profile (?P<fields>.*)")
 FIELD_RE = re.compile(r"(?P<key>[A-Za-z_][A-Za-z0-9_]*)=(?P<value>\S+)")
 NUMERIC_RE = re.compile(r"^-?(?:\d+\.?\d*|\.\d+)$")
@@ -50,18 +53,22 @@ def parse_logs(paths: Iterable[Path]) -> dict[str, list[dict[str, object]]]:
                 match = TRANSFER_RE.search(line)
                 event = "transfer"
                 if not match:
-                    match = CONNECTOR_LOAD_PROFILE_RE.search(line)
+                    match = START_LOAD_KV_PROFILE_RE.search(line)
                     if match:
-                        event = "connector_load"
+                        event = "start_load_kv"
                     else:
-                        match = CONNECTOR_LOAD_TASK_RE.search(line)
+                        match = CONNECTOR_LOAD_PROFILE_RE.search(line)
                         if match:
-                            event = "connector_load_task"
+                            event = "connector_load"
                         else:
-                            match = PROFILE_RE.search(line)
-                            if not match:
-                                continue
-                            event = match.group("event")
+                            match = CONNECTOR_LOAD_TASK_RE.search(line)
+                            if match:
+                                event = "connector_load_task"
+                            else:
+                                match = PROFILE_RE.search(line)
+                                if not match:
+                                    continue
+                                event = match.group("event")
                 record: dict[str, object] = {
                     "source": str(path),
                     "line": line_no,
@@ -329,6 +336,20 @@ def summarize_connector_load(
     }
 
 
+def summarize_start_load_kv(
+    events: dict[str, list[dict[str, object]]],
+) -> dict[str, object]:
+    profiles = events.get("start_load_kv", [])
+    return {
+        "profiles": len(profiles),
+        "requests": total(profiles, "requests"),
+        "load_requests": total(profiles, "load_requests"),
+        "tasks": total(profiles, "tasks"),
+        "wall_ms": stats(time_values_ms(profiles, "wall_ms", "wall_us")),
+        "errors": sum(1 for profile in profiles if profile.get("status") == "error"),
+    }
+
+
 def summarize_group(label: str, paths: list[Path]) -> dict[str, object]:
     events = parse_logs(paths)
     if events.get("transfer"):
@@ -339,6 +360,7 @@ def summarize_group(label: str, paths: list[Path]) -> dict[str, object]:
             "load": summarize_transfer_operation(events, "load"),
             "store": summarize_transfer_operation(events, "dump"),
             "connector_load": summarize_connector_load(events),
+            "start_load_kv": summarize_start_load_kv(events),
         }
     return {
         "label": label,
@@ -359,6 +381,7 @@ def summarize_group(label: str, paths: list[Path]) -> dict[str, object]:
         "load": summarize_operation(events, "load_summary", "load_task"),
         "store": summarize_operation(events, "store_summary", "store_task"),
         "connector_load": summarize_connector_load(events),
+        "start_load_kv": summarize_start_load_kv(events),
     }
 
 
@@ -511,6 +534,30 @@ def print_connector_load(summary: dict[str, object]) -> None:
         )
 
 
+def print_start_load_kv(summary: dict[str, object]) -> None:
+    start_load = summary.get("start_load_kv")
+    if not isinstance(start_load, dict):
+        return
+    if not start_load.get("profiles"):
+        return
+
+    wall = start_load["wall_ms"]
+    print("start_load_kv:")
+    print(
+        f"  profiles: {start_load['profiles']}, "
+        f"requests: {int(start_load['requests'])}, "
+        f"load_requests: {int(start_load['load_requests'])}, "
+        f"tasks: {int(start_load['tasks'])}, "
+        f"errors: {start_load['errors']}"
+    )
+    print(
+        "  wall_ms: "
+        f"mean={fmt_ms(wall['mean'])}, p50={fmt_ms(wall['p50'])}, "
+        f"p90={fmt_ms(wall['p90'])}, p99={fmt_ms(wall['p99'])}, "
+        f"sum={fmt_ms(wall['sum'])}"
+    )
+
+
 def print_summary(summary: dict[str, object]) -> None:
     print(f"== {summary['label']} ==")
     print(f"logs: {', '.join(summary['paths'])}")
@@ -527,6 +574,7 @@ def print_summary(summary: dict[str, object]) -> None:
     print_operation("dump/store", summary["store"])
     print_transfer_totals(summary)
     print_connector_load(summary)
+    print_start_load_kv(summary)
 
 
 def compare_metric(
@@ -556,6 +604,7 @@ def print_comparison(baseline: dict[str, object], candidate: dict[str, object]) 
             compare_metric(baseline, candidate, op, metric)
 
     compare_connector_load(baseline, candidate)
+    compare_start_load_kv(baseline, candidate)
 
     base_load = op_total_ms(baseline, "load")
     cand_load = op_total_ms(candidate, "load")
@@ -601,6 +650,32 @@ def compare_connector_load(
                 f"candidate={cand:.3f} ms, speedup={speedup:.3f}x, "
                 f"reduction={reduction:.2f}%"
             )
+
+
+def compare_start_load_kv(
+    baseline: dict[str, object],
+    candidate: dict[str, object],
+) -> None:
+    base_start = baseline.get("start_load_kv")
+    cand_start = candidate.get("start_load_kv")
+    if not isinstance(base_start, dict) or not isinstance(cand_start, dict):
+        return
+    if not base_start.get("profiles") and not cand_start.get("profiles"):
+        return
+
+    for metric in ("mean", "p50", "p90", "sum"):
+        base = base_start["wall_ms"][metric]
+        cand = cand_start["wall_ms"][metric]
+        if math.isnan(base) or math.isnan(cand) or cand == 0:
+            print(f"start_load_kv_wall.{metric}: n/a")
+            continue
+        speedup = base / cand
+        reduction = (base - cand) / base * 100 if base else math.nan
+        print(
+            f"start_load_kv_wall.{metric}: baseline={base:.3f} ms, "
+            f"candidate={cand:.3f} ms, speedup={speedup:.3f}x, "
+            f"reduction={reduction:.2f}%"
+        )
 
 
 def print_total_comparison(name: str, baseline_ms: float, candidate_ms: float) -> None:
