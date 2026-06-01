@@ -1157,6 +1157,9 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
         for load_task in tasks:
             has_error = not self._wait_load_task(load_task) or has_error
 
+        if load_requests == 0:
+            return
+
         start_load_kv_wall_us = _now_us() - start_load_kv_start_us
         start_load_kv_status = "error" if has_error else "ok"
         logger.info(
