@@ -21,14 +21,12 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
  * */
-#include <exception>
 #include <memory>
 #include <numeric>
 #include "buffer_manager.h"
 #include "logger/logger.h"
-#include "trans/cuda/gdr/gdr_copy.h"
-#include "trans/cuda/gdr/gdr_mr_buffer.h"
 #include "trans/cuda/gdr/gdr_config.h"
+#include "trans/device.h"
 #include "trans_manager.h"
 
 namespace UC::CacheStore {
@@ -38,7 +36,7 @@ class CacheStore : public StoreV1 {
     bool transEnable_{false};
     TransManager transMgr_;
     std::unique_ptr<Trans::GdrKVBufferConfig> gpuKvBufferRegistrations_{nullptr};
-    std::vector<std::shared_ptr<GdrCopyChannel>> gdrMrOnlyChannels_{};
+    std::vector<std::unique_ptr<Trans::Stream>> idleGdrStreams_{};
 
 public:
     Status Setup(const Detail::Dictionary& inConfig) override
@@ -124,25 +122,24 @@ private:
             return s;
         }
 
-        auto nicName = Trans::GdrNicConfig::ResolveNicName(config.deviceId);
-        if (!nicName) [[unlikely]] {
-            UC_ERROR("Failed({}) to resolve GDR NIC for device({}).", nicName.Error(),
-                     config.deviceId);
-            return nicName.Error();
+        Trans::Device device;
+        s = device.Setup(config.deviceId);
+        if (s.Failure()) [[unlikely]] {
+            UC_ERROR("Failed({}) to setup device({}) for idle GDR streams.", s, config.deviceId);
+            return s;
         }
-        try {
-            gdrMrOnlyChannels_.push_back(GdrCopyLib::Open(config.deviceId, nicName.Value()));
-        } catch (const std::exception& e) {
-            auto status = Status::OsApiError(fmt::format(
-                "failed to materialize GPU KV MR registration on device({}): {}",
-                config.deviceId, e.what()));
-            UC_ERROR("Failed({}) to open MR-only GDR channel.", status);
-            return status;
+        for (size_t i = 0; i < config.streamNumber * 2; ++i) {
+            auto stream = device.MakeGdrStream();
+            if (!stream) [[unlikely]] {
+                return Status::Error("failed to create idle GDR stream");
+            }
+            idleGdrStreams_.push_back(std::move(stream));
         }
 
         config.useGdr = false;
-        UC_INFO("GDR MR-only experiment enabled: registered GPU KV MR, but CacheStore transfer "
-                "uses CUDA stream.");
+        UC_INFO("GDR MR+idle-stream experiment enabled: registered GPU KV MR and started {} idle "
+                "GDR streams, but CacheStore transfer uses CUDA stream.",
+                idleGdrStreams_.size());
         return Status::OK();
     }
 
