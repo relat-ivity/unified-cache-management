@@ -21,13 +21,10 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
  * */
-#include <exception>
 #include <memory>
 #include <numeric>
 #include "buffer_manager.h"
 #include "logger/logger.h"
-#include "trans/cuda/gdr/gdr_copy.h"
-#include "trans/cuda/gdr/gdr_mr_buffer.h"
 #include "trans/cuda/gdr/gdr_config.h"
 #include "trans_manager.h"
 
@@ -38,7 +35,6 @@ class CacheStore : public StoreV1 {
     bool transEnable_{false};
     TransManager transMgr_;
     std::unique_ptr<Trans::GdrKVBufferConfig> gpuKvBufferRegistrations_{nullptr};
-    std::vector<std::shared_ptr<GdrCopyChannel>> gdrMrOnlyChannels_{};
 
 public:
     Status Setup(const Detail::Dictionary& inConfig) override
@@ -49,9 +45,14 @@ public:
             UC_ERROR("Failed to check config params: {}.", s);
             return s;
         }
-        if (config.useGdr) {
-            s = SetupGdrMrOnlyExperiment(config);
-            if (s.Failure()) [[unlikely]] { return s; }
+        if (config.deviceId >= 0 && !config.gpuKvBufferAddrs.empty()) {
+            gpuKvBufferRegistrations_ = std::make_unique<Trans::GdrKVBufferConfig>();
+            s = gpuKvBufferRegistrations_->Register(config.gpuKvBufferAddrs,
+                                                    config.gpuKvBufferSizes);
+            if (s.Failure()) [[unlikely]] {
+                UC_ERROR("Failed({}) to register GPU KV buffers.", s);
+                return s;
+            }
         }
         s = bufferMgr_.Setup(config);
         if (s.Failure()) [[unlikely]] {
@@ -112,38 +113,6 @@ public:
     }
 
 private:
-    Status SetupGdrMrOnlyExperiment(Config& config)
-    {
-        gpuKvBufferRegistrations_ = std::make_unique<Trans::GdrKVBufferConfig>();
-        auto s = gpuKvBufferRegistrations_->Register(config.gpuKvBufferAddrs,
-                                                     config.gpuKvBufferSizes);
-        if (s.Failure()) [[unlikely]] {
-            UC_ERROR("Failed({}) to register GPU KV buffers.", s);
-            return s;
-        }
-
-        auto nicName = Trans::GdrNicConfig::ResolveNicName(config.deviceId);
-        if (!nicName) [[unlikely]] {
-            UC_ERROR("Failed({}) to resolve GDR NIC for device({}).", nicName.Error(),
-                     config.deviceId);
-            return nicName.Error();
-        }
-        try {
-            gdrMrOnlyChannels_.push_back(GdrCopyLib::Open(config.deviceId, nicName.Value()));
-        } catch (const std::exception& e) {
-            auto status = Status::OsApiError(fmt::format(
-                "failed to materialize GPU KV MR registration on device({}): {}",
-                config.deviceId, e.what()));
-            UC_ERROR("Failed({}) to open MR-only GDR channel.", status);
-            return status;
-        }
-
-        config.useGdr = false;
-        UC_INFO("GDR MR-only experiment enabled: registered GPU KV MR, but CacheStore transfer "
-                "uses CUDA stream.");
-        return Status::OK();
-    }
-
     Config ParseConfig(const Detail::Dictionary& config)
     {
         Config param;
