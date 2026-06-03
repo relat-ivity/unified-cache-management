@@ -49,11 +49,9 @@ public:
             UC_ERROR("Failed to check config params: {}.", s);
             return s;
         }
-        if (config.useGdr && config.deviceId >= 0 && !config.gpuKvBufferAddrs.empty()) {
+        if (config.useGdr) {
             s = SetupGdrMrOnlyExperiment(config);
             if (s.Failure()) [[unlikely]] { return s; }
-        } else if (config.useGdr) {
-            config.useGdr = false;
         }
         s = bufferMgr_.Setup(config);
         if (s.Failure()) [[unlikely]] {
