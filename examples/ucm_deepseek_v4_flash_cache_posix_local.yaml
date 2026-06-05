@@ -2,15 +2,14 @@
 ucm_connectors:
   - ucm_connector_name: "UcmPipelineStore"
     ucm_connector_config:
-      store_pipeline: "Cache|Posix"
-      storage_backends: "/mnt/test"
+      store_pipeline: "Cache|Empty"
       io_direct: false
-      share_buffer_enable: false
-      cache_buffer_capacity_gb: 10
-      use_gdr: true
+      share_buffer_enable: true
+      cache_buffer_capacity_gb: 32
+      use_gdr: false
 
 enable_event_sync: true
-use_layerwise: true
+use_layerwise: false
 enable_record_traces: false
 use_lite: false
 persist_token_threshold: 0

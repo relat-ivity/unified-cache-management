@@ -11,7 +11,9 @@ vllm serve /home/models/DeepSeek-V4-Flash \
   --enable-expert-parallel \
   --tensor-parallel-size 4 \
   --max-num-batched-tokens 8192 \
-  --max-model-len 8192 \
+  --no-enable-prefix-caching \
+  --enforce-eager \
+  --gpu-memory-utilization 0.8 \
   --no-disable-hybrid-kv-cache-manager \
   --host 0.0.0.0 \
   --port 8000 \
