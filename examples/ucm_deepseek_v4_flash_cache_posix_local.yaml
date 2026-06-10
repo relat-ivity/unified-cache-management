@@ -6,7 +6,7 @@ ucm_connectors:
       io_direct: false
       share_buffer_enable: true
       cache_buffer_capacity_gb: 32
-      use_gdr: false
+      use_gdr: false # true false
 
 enable_event_sync: true
 use_layerwise: false

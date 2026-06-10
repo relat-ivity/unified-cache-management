@@ -2,8 +2,6 @@
 export CUDA_VISIBLE_DEVICES=0,1,2,3 # ,4,5,6,7
 export DEVICE_GDR_NICS=mlx5_0,mlx5_2,mlx5_4,mlx5_6 # ,mlx5_8,mlx5_10,mlx5_12,mlx5_14
 
-LOG_FILE="./vllm_deepseek_v4_flash_$(date +%Y%m%d_%H%M%S).log"
-
 vllm serve /home/models/DeepSeek-V4-Flash \
   --trust-remote-code \
   --kv-cache-dtype fp8 \
@@ -24,4 +22,5 @@ vllm serve /home/models/DeepSeek-V4-Flash \
     "kv_role": "kv_both",
     "kv_connector_extra_config": {"UCM_CONFIG_FILE": "./examples/ucm_deepseek_v4_flash_cache_posix_local.yaml"}
   }' \
-2>&1 | tee "./vllm_deepseek_v4_flash_$(date +%Y%m%d_%H%M%S).log"
+2>&1 | tee "./deepseek_gdr.log" # deepseek_gdr deepseek_cuda
+#   --profiler-config '{"profiler":"torch","torch_profiler_dir":"./vllm_profile"}'
