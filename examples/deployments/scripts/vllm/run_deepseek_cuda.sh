@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-export CUDA_VISIBLE_DEVICES=0,1,2,3 # ,4,5,6,7
-export DEVICE_GDR_NICS=mlx5_0,mlx5_2,mlx5_4,mlx5_6 # ,mlx5_8,mlx5_10,mlx5_12,mlx5_14
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export DEVICE_GDR_NICS=mlx5_0,mlx5_2,mlx5_4,mlx5_6,mlx5_8,mlx5_10,mlx5_12,mlx5_14
 
 vllm serve /home/models/DeepSeek-V4-Flash \
   --trust-remote-code \
   --kv-cache-dtype fp8 \
   --block-size 256 \
   --enable-expert-parallel \
-  --tensor-parallel-size 4 \
+  --tensor-parallel-size 8 \
   --max-num-batched-tokens 8192 \
   --no-enable-prefix-caching \
   --gpu-memory-utilization 0.8 \
