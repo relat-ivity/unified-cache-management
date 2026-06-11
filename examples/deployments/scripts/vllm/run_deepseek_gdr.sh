@@ -19,7 +19,7 @@ vllm serve /home/models/DeepSeek-V4-Flash \
     "kv_connector": "UCMConnector",
     "kv_connector_module_path": "ucm.integration.vllm.ucm_connector",
     "kv_role": "kv_both",
-    "kv_connector_extra_config": {"UCM_CONFIG_FILE": "./examples/ucm_deepseek_v4_flash_cache_posix_local.yaml"}
+    "kv_connector_extra_config": {"UCM_CONFIG_FILE": "./examples/ucm_deepseek_gdr.yaml"}
   }' \
 2>&1 | tee "./deepseek_gdr.log" # deepseek_gdr deepseek_cuda
 #   --profiler-config '{"profiler":"torch","torch_profiler_dir":"./vllm_profile"}'
