@@ -8,7 +8,7 @@ vllm serve /home/models/DeepSeek-V4-Flash \
   --block-size 256 \
   --enable-expert-parallel \
   --tensor-parallel-size 8 \
-  --max-num-batched-tokens 8192 \
+  --max-num-batched-tokens 32768 \
   --no-enable-prefix-caching \
   --gpu-memory-utilization 0.8 \
   --no-disable-hybrid-kv-cache-manager \
