@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Analyze FAWA start_load_kv wall-time records from vLLM logs."""
+"""Analyze connector start_load_kv wall-time records from vLLM logs."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from typing import Iterable
 
 
 START_LOAD_KV_PROFILE_RE = re.compile(
-    r"FAWA connector start_load_kv profile (?P<fields>.*)"
+    r"(?:FAWA|UCM|HMA) connector start_load_kv profile (?P<fields>.*)"
 )
 HIT_EXTERNAL_RE = re.compile(
     r"(?:FAWA\s+)?request_id:\s*(?P<request_id>[^,\s]+),"
@@ -306,7 +306,7 @@ def print_comparison(baseline: dict[str, object], candidate: dict[str, object]) 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Analyze FAWA connector start_load_kv wall-time records."
+        description="Analyze connector start_load_kv wall-time records."
     )
     parser.add_argument("logs", nargs="*", help="Log files or glob patterns.")
     parser.add_argument(

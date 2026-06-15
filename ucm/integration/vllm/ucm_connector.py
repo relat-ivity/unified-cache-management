@@ -51,6 +51,14 @@ from ucm.sparse.state import has_ucm_sparse
 logger = init_logger(__name__)
 
 
+def _now_us() -> int:
+    return time.perf_counter_ns() // 1000
+
+
+def _epoch_us() -> int:
+    return time.time_ns() // 1000
+
+
 def _short_list(values: list[int], limit: int = 12) -> list[int]:
     return values[:limit]
 
@@ -704,13 +712,17 @@ class UCMDirectConnector(KVConnectorBase_V1):
         return UCMConnectorMetadata(requests_dispatch_meta)
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
+        start_load_kv_start_us = _now_us()
+        start_load_kv_epoch_start_us = _epoch_us()
         metadata = self._get_connector_metadata()
         assert isinstance(metadata, UCMConnectorMetadata)
 
         request_to_task: dict[str, Task] = {}
         is_load = False
+        has_error = False
         num_loaded_block = 0
         num_loaded_request = 0
+        load_request_ids: list[str] = []
         load_start_time = time.perf_counter() * 1000
         request_to_load_blocks: dict[str, int] = {}
         for request_id, request in metadata.request_meta.items():
@@ -732,6 +744,7 @@ class UCMDirectConnector(KVConnectorBase_V1):
                     num_loaded_request -= 1
                     continue
                 num_loaded_block -= len(request.load_block_ids[0]) - len(ucm_block_ids)
+            load_request_ids.append(str(request_id))
             if self.tp_rank != 0 and not self.is_mla:
                 for i, ucm_block_id in enumerate(ucm_block_ids):
                     ucm_block_ids[i] = self.request_hasher(ucm_block_id)
@@ -749,6 +762,7 @@ class UCMDirectConnector(KVConnectorBase_V1):
                 self._invalid_block_ids.update(
                     metadata.request_meta[request_id].load_block_ids[1]
                 )
+                has_error = True
                 num_loaded_block -= len(ucm_block_ids)
 
         for request_id, task in request_to_task.items():
@@ -761,6 +775,7 @@ class UCMDirectConnector(KVConnectorBase_V1):
                 self._invalid_block_ids.update(
                     metadata.request_meta[request_id].load_block_ids[1]
                 )
+                has_error = True
                 num_loaded_block -= request_to_load_blocks.get(request_id, 0)
 
         load_end_time = time.perf_counter() * 1000
@@ -777,6 +792,20 @@ class UCMDirectConnector(KVConnectorBase_V1):
                     "load_speed": load_speed,
                     "load_bytes_total": load_bytes,
                 }
+            )
+            start_load_kv_wall_us = _now_us() - start_load_kv_start_us
+            start_load_kv_epoch_end_us = _epoch_us()
+            start_load_kv_status = "error" if has_error else "ok"
+            logger.info(
+                f"UCM connector start_load_kv profile "
+                f"tp_rank={self.tp_rank} local_rank={self.local_rank} "
+                f"requests={len(metadata.request_meta)} "
+                f"load_requests={num_loaded_request} "
+                f"request_ids={','.join(sorted(load_request_ids))} "
+                f"start_us={start_load_kv_epoch_start_us} "
+                f"end_us={start_load_kv_epoch_end_us} "
+                f"tasks={len(request_to_task)} wall_us={start_load_kv_wall_us} "
+                f"status={start_load_kv_status}"
             )
 
     def wait_for_layer_load(self, layer_name: str) -> None:
