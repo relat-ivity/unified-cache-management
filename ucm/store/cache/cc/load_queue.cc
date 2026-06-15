@@ -207,6 +207,8 @@ Status LoadQueue::HostToDeviceScatterAsync(std::shared_ptr<Trans::Stream> stream
             UC_ERROR("Failed({}) to do H2D({}) batch({}/{}) async.", s, size, i, number);
             return s;
         }
+        UC_INFO_UNLIMITED("Cache load H2D scatter IO: index={}/{}, size_bytes={}.", i + 1,
+                          number, size);
         offset += size;
     }
     return Status::OK();
