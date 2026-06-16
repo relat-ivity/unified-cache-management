@@ -16,7 +16,7 @@ vllm bench serve \
   --prefix-repetition-num-prefixes 1 \
   --prefix-repetition-output-len 2 \
   --max-concurrency 1 \
-  --send 100 \
+  --seed 100 \
   2>&1 | tee -a "./result/100.log"
 
 # 95%
