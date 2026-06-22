@@ -1,8 +1,5 @@
-import dataclasses
 import json
 import os
-import shutil
-import subprocess
 
 import pytest
 import requests
@@ -16,103 +13,14 @@ from common.uc_eval.task import (
 )
 from common.uc_eval.utils.data_class import ModelConfig, PerfConfig
 
-RUN_LEGACY_UC_PERF = os.getenv("RUN_LEGACY_UC_PERF", "").lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
-LEGACY_UC_PERF_SKIP = pytest.mark.skipif(
-    not RUN_LEGACY_UC_PERF,
-    reason="Set RUN_LEGACY_UC_PERF=1 to run legacy llmperf/uc_eval cases",
-)
-
-VLLM_BENCH_TIMEOUT_S = int(os.getenv("VLLM_BENCH_TIMEOUT_S", "21600"))
-
-
-def _vllm_bench_command(num_prompts: int, prefix_len: int, suffix_len: int) -> list[str]:
-    return [
-        "vllm",
-        "bench",
-        "serve",
-        "--backend",
-        "vllm",
-        "--base-url",
-        "http://127.0.0.1:8000",
-        "--endpoint",
-        "/v1/completions",
-        "--model",
-        "/models/MiniMax-M2.7",
-        "--dataset-name",
-        "prefix_repetition",
-        "--num-prompts",
-        str(num_prompts),
-        "--prefix-repetition-prefix-len",
-        str(prefix_len),
-        "--prefix-repetition-suffix-len",
-        str(suffix_len),
-        "--prefix-repetition-num-prefixes",
-        "1",
-        "--prefix-repetition-output-len",
-        "2",
-        "--max-concurrency",
-        "1",
-        "--seed",
-        "90",
-    ]
-
-
-def _run_vllm_bench_command(phase: str, command: list[str]) -> None:
-    vllm_bin = shutil.which("vllm")
-    if not vllm_bin:
-        pytest.skip("vllm CLI not found")
-
-    runnable = [vllm_bin, *command[1:]]
-    print(f"\n[INFO] Running vLLM bench phase: {phase}")
-    print("[INFO] Command: " + " ".join(command))
-
-    try:
-        proc = subprocess.run(
-            runnable,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=VLLM_BENCH_TIMEOUT_S,
-        )
-    except subprocess.TimeoutExpired as exc:
-        output = exc.stdout or ""
-        print(output)
-        pytest.fail(
-            f"vllm bench {phase} timed out after {VLLM_BENCH_TIMEOUT_S} seconds"
-        )
-
-    print(proc.stdout)
-    assert proc.returncode == 0, f"vllm bench {phase} failed"
-
-
-@pytest.mark.stage(2)
-@pytest.mark.feature("uc_performance_test")
-def test_vllm_bench_90_reuse_rate():
-    _run_vllm_bench_command(
-        "prefill_90",
-        _vllm_bench_command(num_prompts=1, prefix_len=115200, suffix_len=0),
-    )
-    _run_vllm_bench_command(
-        "bench_90",
-        _vllm_bench_command(num_prompts=50, prefix_len=115200, suffix_len=12800),
-    )
-
-
 perf_scenarios = [
     # (mean_in, mean_out, max_req, concurrent, random_seed, hit_rate)
     (1000, 1024, 8, 8, 0, 0),
     (4000, 500, 1, 1, 0, 0),
 ]
 
-perf_test_case_str = os.getenv("PERF_TEST_CASE") if RUN_LEGACY_UC_PERF else None
-if not RUN_LEGACY_UC_PERF:
-    pass
-elif perf_test_case_str:
+perf_test_case_str = os.getenv("PERF_TEST_CASE")
+if perf_test_case_str:
     try:
         parsed = json.loads(perf_test_case_str)
         if isinstance(parsed, list) and len(parsed) > 0:
@@ -145,8 +53,7 @@ elif perf_test_case_str:
 else:
     print("PERF_TEST_CASE environment variable is not set, using default configuration")
 
-if RUN_LEGACY_UC_PERF:
-    print(f"Final perf_scenarios: {perf_scenarios}")
+print(f"Final perf_scenarios: {perf_scenarios}")
 
 
 scenario_ids = [f"in_{s[0]}-out_{s[1]}-con_{s[3]}" for s in perf_scenarios]
@@ -172,7 +79,6 @@ def _send_profile_request(action: str) -> bool:
     print(f"[INFO] Profiler {action}ed successfully")
 
 
-@LEGACY_UC_PERF_SKIP
 @pytest.mark.stage(2)
 @pytest.mark.feature("uc_performance_test")
 @pytest.mark.parametrize(
@@ -285,7 +191,6 @@ sync_perf_cases = [
 ]
 
 
-@LEGACY_UC_PERF_SKIP
 @pytest.mark.feature("sync_perf_test")
 @pytest.mark.stage(2)
 @pytest.mark.parametrize("perf_config", sync_perf_cases)
@@ -311,7 +216,6 @@ multiturn_dialogue_perf_cases = [
 ]
 
 
-@LEGACY_UC_PERF_SKIP
 @pytest.mark.feature("dialogue_perf_test")
 @pytest.mark.stage(2)
 @pytest.mark.parametrize("perf_config", multiturn_dialogue_perf_cases)
@@ -337,7 +241,6 @@ doc_qa_perf_cases = [
 ]
 
 
-@LEGACY_UC_PERF_SKIP
 @pytest.mark.feature("qa_perf_test")
 @pytest.mark.stage(2)
 @pytest.mark.parametrize("perf_config", doc_qa_perf_cases)
