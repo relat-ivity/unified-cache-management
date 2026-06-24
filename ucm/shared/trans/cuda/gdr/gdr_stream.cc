@@ -25,18 +25,67 @@
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <cstdlib>
 #include <cuda_runtime.h>
+#include <optional>
 #include <string>
+#include <sys/types.h>
 #include <thread>
 #include <utility>
+#include <vector>
 #include "gdr_config.h"
 #include "logger/logger.h"
+#include "thread/cpu_affinity.h"
 
 namespace {
+
+constexpr const char* kGdrCpuCoresPerWorkerEnv = "UCM_GDR_STREAM_CPU_CORES_PER_WORKER";
+constexpr const char* kGdrCpuCoreOffsetEnv = "UCM_GDR_STREAM_CPU_CORE_OFFSET";
 
 UC::Status MakeGdrStatus(const char* op, int rc)
 {
     return UC::Status::OsApiError(fmt::format("{} failed({})", op, rc));
+}
+
+std::optional<long> ParseIntegerEnv(const char* name)
+{
+    const char* raw = std::getenv(name);
+    if (raw == nullptr || raw[0] == '\0') { return std::nullopt; }
+
+    char* end = nullptr;
+    errno = 0;
+    long value = std::strtol(raw, &end, 10);
+    if (errno != 0 || end == raw || *end != '\0') {
+        UC_WARN("Ignore invalid {}={}.", name, raw);
+        return std::nullopt;
+    }
+    return value;
+}
+
+void ApplyGdrStreamCpuAffinity(int32_t deviceId, const char* threadName)
+{
+    auto coresPerWorker = ParseIntegerEnv(kGdrCpuCoresPerWorkerEnv);
+    if (!coresPerWorker || *coresPerWorker <= 0) { return; }
+
+    auto coreOffset = ParseIntegerEnv(kGdrCpuCoreOffsetEnv).value_or(0);
+    auto start = coreOffset + static_cast<long>(deviceId) * (*coresPerWorker);
+    if (start < 0) {
+        UC_WARN("Ignore negative GDR stream CPU affinity start core {}.", start);
+        return;
+    }
+
+    std::vector<ssize_t> cores;
+    cores.reserve(static_cast<size_t>(*coresPerWorker));
+    for (long i = 0; i < *coresPerWorker; ++i) {
+        cores.push_back(static_cast<ssize_t>(start + i));
+    }
+
+    auto status = UC::CpuAffinity::SetCpuAffinity4CurrentThread(cores);
+    if (status.Failure()) {
+        UC_WARN("Failed({}) to set {} CPU affinity to {}.", status, threadName, cores);
+        return;
+    }
+    UC_INFO("Set {} CPU affinity to {} for GDR device({}).", threadName, cores, deviceId);
 }
 
 }  // namespace
@@ -275,6 +324,7 @@ void GdrStream::ResetOperationRing()
 
 void GdrStream::SchedulerLoop()
 {
+    ApplyGdrStreamCpuAffinity(deviceId_, "GDR scheduler thread");
     const auto ret = cudaSetDevice(deviceId_);
     if (ret != cudaSuccess) {
         StopWithAsyncError("cudaSetDevice", Status{ret, cudaGetErrorString(ret)});
@@ -352,6 +402,7 @@ GdrStream::SubmitResult GdrStream::SubmitCopyOperationFromQueue(const Operation&
 
 void GdrStream::CompletionLoop()
 {
+    ApplyGdrStreamCpuAffinity(deviceId_, "GDR completion thread");
     for (;;) {
         const auto notifyRc = channel_->RequestCompletionNotification();
         if (notifyRc != 0) {
