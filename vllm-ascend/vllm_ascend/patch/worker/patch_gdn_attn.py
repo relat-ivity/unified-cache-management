@@ -24,6 +24,9 @@ from vllm_ascend.ops.triton.gdn_chunk_meta import (
     _validate_cu_seqlens,
     build_chunk_meta_device,
 )
+from vllm_ascend.patch.platform.patch_mamba_config import (     
+    _qwen35_g_cache_enabled, 
+)
 from vllm_ascend.utils import is_310p
 
 _GDN_CHUNK_SIZE = 64
@@ -550,6 +553,44 @@ def _build_non_spec_chunked_prefill_meta(
     _fill_chunk_meta_device_tensors(builder, cu_seqlens, tensors)
     return _build_chunked_prefill_metadata(builder, tensors, slot=slot)
 
+ 
+def _build_g_kv_cache_metadata( 
+    common_attn_metadata, 
+) -> tuple[torch.Tensor, torch.Tensor]: 
+    """Select scheduler-level prefill tokens and their physical slots.""" 
+    slot_mapping = common_attn_metadata.slot_mapping[ 
+        : common_attn_metadata.num_actual_tokens 
+    ] 
+    is_prefilling = common_attn_metadata.is_prefilling 
+    if is_prefilling is None: 
+        raise RuntimeError( 
+            "Qwen3.5 g KV cache requires CommonAttentionMetadata.is_prefilling." 
+        ) 
+ 
+    num_reqs = common_attn_metadata.num_reqs 
+    query_lens_cpu = torch.diff( 
+        common_attn_metadata.query_start_loc_cpu[: num_reqs + 1] 
+    ) 
+    is_prefilling_cpu = is_prefilling[:num_reqs] 
+    if is_prefilling_cpu.device.type != "cpu": 
+        is_prefilling_cpu = is_prefilling_cpu.cpu() 
+ 
+    prefill_token_mask_cpu = torch.repeat_interleave( 
+        is_prefilling_cpu, 
+        query_lens_cpu, 
+        output_size=common_attn_metadata.num_actual_tokens, 
+    ) 
+    token_indices_cpu = torch.nonzero( 
+        prefill_token_mask_cpu, 
+        as_tuple=True, 
+    )[0] 
+    token_indices = token_indices_cpu.to( 
+        device=slot_mapping.device, 
+        dtype=torch.long, 
+        non_blocking=True, 
+    ) 
+    return token_indices, slot_mapping.index_select(0, token_indices) 
+
 
 def _compute_all_mode_metadata(builder, attn_metadata, m):
     """Compute all-mode prefix caching metadata and attach to attn_metadata.
@@ -615,6 +656,7 @@ def _compute_all_mode_metadata(builder, attn_metadata, m):
     prefill_chunk_offsets = None
     scatter_src_indices = torch.empty(0, dtype=torch.long, device=device)
     scatter_dst_slots = torch.empty(0, dtype=torch.long, device=device)
+    conv_scatter_end_indices = torch.empty(0, dtype=torch.long, device=device)
     if num_prefills > 0:
         prefill_query_lens = query_lens[num_decodes:]
         prefill_context_lens = context_lens[num_decodes:]
@@ -654,6 +696,15 @@ def _compute_all_mode_metadata(builder, attn_metadata, m):
             scatter_rows = block_table_2d[num_decodes:].index_select(0, scatter_seq_ids)
             scatter_block_indices = prefill_block_first.to(torch.long).index_select(0, scatter_seq_ids) + local_offsets
             scatter_dst_slots = scatter_rows.gather(1, scatter_block_indices.unsqueeze(1)).squeeze(1).to(torch.long)
+
+            # Conv state at a block boundary is simply the last
+            # (kernel_width - 1) mixed_qkv inputs before that boundary.
+            # Save the flattened token END position for each intermediate
+            # boundary so the forward path can gather those inputs directly,
+            # without replacing the native CausalConv1d with the APC Triton
+            # convolution kernel.
+            prefill_query_starts = m.query_start_loc[num_decodes:num_seqs].to(torch.long)
+            conv_scatter_end_indices = prefill_query_starts.index_select(0, scatter_seq_ids) + (local_offsets + 1) * block_size            
             scatter_src_indices = (
                 prefill_chunk_offsets[:-1].index_select(0, scatter_seq_ids)
                 + prefill_chunk_start
@@ -666,6 +717,7 @@ def _compute_all_mode_metadata(builder, attn_metadata, m):
             if valid_scatter.numel() != scatter_dst_slots.numel():
                 scatter_dst_slots = scatter_dst_slots.index_select(0, valid_scatter)
                 scatter_src_indices = scatter_src_indices.index_select(0, valid_scatter)
+                conv_scatter_end_indices = conv_scatter_end_indices.index_select(0, valid_scatter)
 
     attn_metadata.is_all_mode = True
     attn_metadata.mamba_block_size = block_size
@@ -680,6 +732,7 @@ def _compute_all_mode_metadata(builder, attn_metadata, m):
     attn_metadata.prefill_chunk_offsets = prefill_chunk_offsets
     attn_metadata.scatter_src_indices_tensor = scatter_src_indices
     attn_metadata.scatter_dst_slots_tensor = scatter_dst_slots
+    attn_metadata.conv_scatter_end_indices_tensor = conv_scatter_end_indices
 
 
 def _warn_all_mode_spec_fallback_once() -> None:
@@ -701,6 +754,14 @@ def _patched_build(
     num_decode_draft_tokens_cpu: torch.Tensor | None = None,
     fast_build: bool = False,
 ):
+    save_g_to_kv_cache = _qwen35_g_cache_enabled(self.vllm_config)
+    if save_g_to_kv_cache:
+        # Capture scheduler semantics before the GDN builder can reclassify a
+        # one-token prefill as decode. Decode requests must never write g_cache.
+        g_prefill_token_indices, g_prefill_slot_mapping = (
+            _build_g_kv_cache_metadata(common_attn_metadata)
+        )
+
     cache_config = self.vllm_config.cache_config
 
     def _build_with_cache_mode(cache_mode: str | None = None):
@@ -732,6 +793,14 @@ def _patched_build(
             attn_metadata.is_all_mode = False
         else:
             _compute_all_mode_metadata(self, attn_metadata, common_attn_metadata)
+
+    if save_g_to_kv_cache:
+        attn_metadata._ascend_g_prefill_token_indices = (
+            g_prefill_token_indices
+        )
+        attn_metadata._ascend_g_prefill_slot_mapping = (
+            g_prefill_slot_mapping
+        )
 
     if attn_metadata.num_prefills <= 0:
         return attn_metadata

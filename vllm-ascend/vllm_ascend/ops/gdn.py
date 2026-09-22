@@ -35,10 +35,7 @@ from vllm_ascend.ops.triton.fla.fused_qkvzba_split_reshape import fused_qkvzba_s
 from vllm_ascend.ops.triton.fla.sigmoid_gating import fused_sigmoid_gating_delta_rule_update
 from vllm_ascend.ops.triton.fla.utils import clear_ssm_states
 from vllm_ascend.ops.triton.fused_gdn_gating import fused_gdn_gating_patch
-from vllm_ascend.ops.triton.mamba.causal_conv1d import (
-    causal_conv1d_fn,
-    causal_conv1d_update_npu,
-)
+from vllm_ascend.ops.triton.mamba.causal_conv1d import causal_conv1d_update_npu
 from vllm_ascend.utils import enable_sp
 
 # ──────────────────────────────────────────────────────────────────
@@ -200,6 +197,46 @@ def _scatter_intermediate_states(
     ssm_state[dst_slots.long()] = write_states
     return
 
+def _scatter_intermediate_conv_states(
+    conv_state_raw: torch.Tensor,
+    mixed_qkv: torch.Tensor,
+    metadata,
+) -> None:
+    """Save all-mode intermediate conv states without recomputing conv1d.
+
+    For a causal conv with width W, the state at a block boundary is exactly
+    the last W-1 *input* tokens before that boundary.  Therefore all-mode does
+    not need a special convolution kernel just to materialize intermediate
+    conv states: gather the corresponding mixed_qkv windows and scatter them
+    into the same block slots used by the SSM intermediate-state plan.
+
+    conv_state_raw layout: [num_cache_lines, state_len, dim]
+    mixed_qkv layout:      [num_tokens, dim]
+    """
+    boundary_ends = getattr(metadata, "conv_scatter_end_indices_tensor", None)
+    dst_slots = getattr(metadata, "scatter_dst_slots_tensor", None)
+    if boundary_ends is None or dst_slots is None or boundary_ends.numel() == 0:
+        return
+
+    if mixed_qkv.dim() != 2:
+        raise RuntimeError(
+            "all-mode native conv-state scatter expects mixed_qkv to be "
+            f"2-D [num_tokens, dim], got shape={tuple(mixed_qkv.shape)}"
+        )
+    if boundary_ends.numel() != dst_slots.numel():
+        raise RuntimeError(
+            "Conv-state scatter plan mismatch: boundary end indices and "
+            "destination slots must have the same length."
+        )
+
+    state_len = conv_state_raw.shape[-2]
+    offsets = torch.arange(state_len, device=mixed_qkv.device, dtype=torch.long)
+    token_indices = boundary_ends.long().unsqueeze(1) - state_len + offsets.unsqueeze(0)
+    flat_indices = token_indices.reshape(-1)
+    write_states = mixed_qkv.index_select(0, flat_indices).reshape(
+        boundary_ends.numel(), state_len, mixed_qkv.shape[-1]
+    )
+    conv_state_raw[dst_slots.long()] = write_states.to(conv_state_raw.dtype)
 
 def _copy_core_attn_output(
     core_attn_out: torch.Tensor,
@@ -216,12 +253,10 @@ def _copy_core_attn_output(
 
 def _run_all_mode_non_spec_conv1d(
     mixed_qkv_non_spec: torch.Tensor | None,
-    conv_state: torch.Tensor,
+    conv_state_raw: torch.Tensor,
     conv_weights: torch.Tensor,
     attn_metadata,
-    non_spec_query_start_loc: torch.Tensor,
     non_spec_state_indices_tensor: torch.Tensor,
-    has_initial_state: torch.Tensor | None,
     conv_bias: torch.Tensor | None,
     activation: bool,
 ) -> torch.Tensor | None:
@@ -230,30 +265,46 @@ def _run_all_mode_non_spec_conv1d(
 
     num_decodes = attn_metadata.num_decodes
     if attn_metadata.num_prefills > 0:
-        num_comp = attn_metadata.num_computed_tokens_all
-        initial_state_idx = torch.where(
-            num_comp > 0,
-            (num_comp - 1) // attn_metadata.mamba_block_size,
-            torch.zeros_like(num_comp),
-        )
-        return causal_conv1d_fn(
-            x=mixed_qkv_non_spec,
-            weight=conv_weights,
-            bias=conv_bias,
-            conv_states=conv_state,
-            query_start_loc=non_spec_query_start_loc,
-            cache_indices=attn_metadata.block_table_2d,
-            has_initial_state=has_initial_state,
-            activation="silu" if activation else None,
+        # The native CausalConv1d op uses one cache slot per sequence for both
+        # initial-state load and final-state writeback.  All-mode keeps SOURCE
+        # and DEST separate, so first seed DEST from SOURCE when needed.
+        src_slots = attn_metadata.block_state_indices
+        dst_slots = non_spec_state_indices_tensor
+        _copy_slots_if_needed(conv_state_raw, src_slots, dst_slots)
+
+        # Intermediate all-mode conv states do not require convolution output:
+        # they are just the last (width - 1) mixed_qkv inputs at each completed
+        # block boundary.  Materialize them directly before invoking the native
+        # op, while mixed_qkv still contains the pre-convolution inputs.
+        _scatter_intermediate_conv_states(
+            conv_state_raw,
+            mixed_qkv_non_spec,
+            attn_metadata,
+        )        
+
+        conv_weights_T = conv_weights.transpose(0, 1)
+        activation_num = 1 if activation else 0
+        (
+            query_start_loc_opt,
+            cache_indices_opt,
+            initial_state_mode_opt,
+        ) = get_non_spec_causal_conv1d_host_args(attn_metadata)
+        return torch.ops._C_ascend.npu_causal_conv1d_custom(
+            mixed_qkv_non_spec,
+            conv_weights_T,
+            conv_state=conv_state_raw,
+            bias_opt=conv_bias,
+            query_start_loc_opt=query_start_loc_opt,
+            cache_indices_opt=cache_indices_opt,
+            initial_state_mode_opt=initial_state_mode_opt,
+            num_accepted_tokens_opt=[],
+            activation_mode=activation_num,
             pad_slot_id=PAD_SLOT_ID,
-            block_idx_first_scheduled_token=attn_metadata.block_idx_first_scheduled_token,
-            block_idx_last_scheduled_token=attn_metadata.block_idx_last_scheduled_token,
-            initial_state_idx=initial_state_idx,
-            num_computed_tokens=attn_metadata.num_computed_tokens_all,
-            block_size_to_align=attn_metadata.mamba_block_size,
-        )
+            run_mode=0,
+        )            
 
     if num_decodes > 0:
+        conv_state = conv_state_raw.transpose(-1, -2)
         src_slots = attn_metadata.block_state_indices[:num_decodes]
         dst_slots = non_spec_state_indices_tensor[:num_decodes]
         _copy_slots_if_needed(conv_state, src_slots, dst_slots)
@@ -396,6 +447,73 @@ def get_non_spec_chunked_prefill_meta(attn_metadata):
 
 
 class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
+    def __init__(
+        self,
+        config,
+        vllm_config,
+        prefix: str = "",
+        create_in_proj_qkvz: bool = True,
+        gqa_interleaved_layout: bool = False,
+    ) -> None:
+        super().__init__(
+            config=config,
+            vllm_config=vllm_config,
+            prefix=prefix,
+            create_in_proj_qkvz=create_in_proj_qkvz,
+            gqa_interleaved_layout=gqa_interleaved_layout,
+        )
+        # Import lazily to avoid a platform-patch <-> custom-op import cycle.
+        from vllm_ascend.patch.platform.patch_mamba_config import (
+            _qwen35_g_cache_enabled,
+        )
+
+        self._save_g_to_kv_cache = _qwen35_g_cache_enabled(vllm_config)
+
+    def get_state_shape(self) -> tuple[tuple[int, ...], ...]:
+        state_shapes = super().get_state_shape()
+        if not getattr(self, "_save_g_to_kv_cache", False):
+            return state_shapes
+
+        g_shape = (
+            self.cache_config.mamba_block_size,
+            self.num_v_heads // self.tp_size,
+        )
+        return (*state_shapes, g_shape)
+
+    def get_state_dtype(self) -> tuple[torch.dtype, ...]:
+        state_dtypes = super().get_state_dtype()
+        if not getattr(self, "_save_g_to_kv_cache", False):
+            return state_dtypes
+        return (*state_dtypes, torch.float32)
+
+    def _save_prefill_g(
+        self,
+        g: torch.Tensor,
+        token_indices: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> None:
+        """Write scheduler-prefill g values into the third Mamba state."""
+        if len(self.kv_cache) != 3:
+            raise RuntimeError(
+                "Qwen3.5 g KV cache expects exactly three Mamba states."
+            )
+
+        g_cache = self.kv_cache[2]
+        g_prefill = g.squeeze(0).index_select(
+            0, token_indices.to(dtype=torch.long)
+        )
+        slots = slot_mapping.to(dtype=torch.long)
+
+        block_size = g_cache.shape[1]
+        valid = (slots >= 0) & (slots < g_cache.shape[0] * block_size)
+        physical_blocks = slots[valid] // block_size
+        block_offsets = slots[valid] % block_size
+
+        # Sidecar only: the recurrent path below still consumes the original g.
+        g_cache[physical_blocks, block_offsets] = g_prefill[valid].to(
+            dtype=g_cache.dtype
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -536,12 +654,10 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         if is_all_mode:
             mixed_qkv_non_spec = _run_all_mode_non_spec_conv1d(
                 mixed_qkv_non_spec,
-                conv_state,
+                self_kv_cache[0],
                 conv_weights,
                 attn_metadata,
-                non_spec_query_start_loc,
                 non_spec_state_indices_tensor,
-                has_initial_state,
                 self.conv1d.bias,
                 self.activation,
             )
@@ -588,6 +704,26 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             # Qwen3Next: torch_npu ops support float16/bf16 ssm_state.
             # g/beta are needed for both spec-decode and decode, so compute unconditionally.
             g, beta = fused_gdn_gating_patch(self.A_log, a, b, self.dt_bias)
+            if getattr(self, "_save_g_to_kv_cache", False):
+                token_indices = getattr(
+                    attn_metadata, "_ascend_g_prefill_token_indices", None
+                )
+                slot_mapping = getattr(
+                    attn_metadata, "_ascend_g_prefill_slot_mapping", None
+                )
+                if (
+                    (token_indices is None or slot_mapping is None)
+                    and attn_metadata.num_prefills > 0
+                ):
+                    raise RuntimeError(
+                        "Qwen3.5 g KV cache is enabled but prefill slot metadata "
+                        "was not built."
+                    )
+                # Decode-only / graph-capture metadata carries no prefill indices.
+                if token_indices is not None and token_indices.numel() > 0:
+                    assert slot_mapping is not None
+                    self._save_prefill_g(g, token_indices, slot_mapping)
+
             if spec_sequence_masks is not None:
                 if attn_metadata.num_prefills == 0 and attn_metadata.num_decodes == 0:
                     g_spec = g
@@ -681,6 +817,26 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             # NOTE: Once torch_npu supports float32 ssm_state, this branch can be removed.
             if attn_metadata.num_prefills > 0 or spec_sequence_masks is not None:
                 g, beta = fused_gdn_gating_patch(self.A_log, a, b, self.dt_bias)
+                if getattr(self, "_save_g_to_kv_cache", False):
+                    token_indices = getattr(
+                        attn_metadata, "_ascend_g_prefill_token_indices", None
+                    )
+                    slot_mapping = getattr(
+                        attn_metadata, "_ascend_g_prefill_slot_mapping", None
+                    )
+                    if (
+                        (token_indices is None or slot_mapping is None)
+                        and attn_metadata.num_prefills > 0
+                    ):
+                        raise RuntimeError(
+                            "Qwen3.5 g KV cache is enabled but prefill slot metadata "
+                            "was not built."
+                        )
+                    # Decode-only / graph-capture metadata carries no prefill indices.
+                    if token_indices is not None and token_indices.numel() > 0:
+                        assert slot_mapping is not None
+                        self._save_prefill_g(g, token_indices, slot_mapping)
+
                 if spec_sequence_masks is not None:
                     if attn_metadata.num_prefills == 0 and attn_metadata.num_decodes == 0:
                         g_spec = g
