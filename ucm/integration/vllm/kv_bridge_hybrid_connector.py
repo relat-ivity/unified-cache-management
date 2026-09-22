@@ -1,19 +1,20 @@
-from __future__ import annotations
-
 import math
 from collections import OrderedDict, defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, ClassVar
+from typing import ClassVar
 
 import numpy as np
 import torch
+from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorRole,
 )
+from vllm.forward_context import ForwardContext
 from vllm.platforms import current_platform
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
+    KVCacheConfig,
     KVCacheSpec,
     MambaSpec,
     MLAAttentionSpec,
@@ -27,9 +28,6 @@ from ucm.integration.vllm.hla_connector import (
     block_size_from_kv_cache_spec,
     layer_name_to_kv_cache_spec,
 )
-from ucm.integration.vllm.request_hasher import (
-    _request_has_extra_hash_semantics,
-)
 from ucm.integration.vllm.ucm_connector import (
     RequestDispatchMeta,
     RequestHasher,
@@ -37,10 +35,6 @@ from ucm.integration.vllm.ucm_connector import (
     _record_counter,
 )
 from ucm.logger import init_logger
-
-if TYPE_CHECKING:
-    from vllm.config import VllmConfig
-    from vllm.v1.kv_cache_interface import KVCacheConfig
 
 logger = init_logger(__name__)
 
@@ -179,7 +173,7 @@ class RotaryEmbedding3D:
 class SingleVllmConfig:
     """Cache the original KVB padding settings per VllmConfig instance."""
 
-    _instances: ClassVar[dict[int, SingleVllmConfig]] = {}
+    _instances: ClassVar[dict[int, "SingleVllmConfig"]] = {}
 
     def __new__(cls, vllm_config):
         key = id(vllm_config)
@@ -221,7 +215,7 @@ def pad_rag_chunks(token_ids: list[int], block_size: int, pad_id: int | None):
     return token_ids[:-1] + [pad_id] * pad_len + token_ids[-1:]
 
 
-def kvb_replace_padding(prompt_token_ids: list[int], vllm_config: VllmConfig):
+def kvb_replace_padding(prompt_token_ids: list[int], vllm_config: "VllmConfig"):
     """Align END-terminated chunks; leave an unfinished prompt tail intact.
 
     Invoke before constructing the scheduler Request and its block hashes.
@@ -297,7 +291,10 @@ class KVCacheLayoutKVB:
 
 class KVCluster:
     def __init__(
-        self, vllm_config: VllmConfig, kvcluster_info: KVClusterInfo, req_id="-1"
+        self,
+        vllm_config: "VllmConfig",
+        kvcluster_info: "KVClusterInfo",
+        req_id="-1",
     ):
         self.kvcluster_info = kvcluster_info
         self.request_hasher = RequestHasher(vllm_config, 0)
@@ -514,7 +511,7 @@ class MambaAllGroupManager:
     def __init__(
         self,
         kv_cache_config: KVCacheConfig,
-        connector: UCMKvBridgeHybridConnector,
+        connector: "UCMKvBridgeHybridConnector",
     ) -> None:
         self.connector = connector
         request_hasher = RequestHasher(connector._vllm_config, 0)
@@ -686,7 +683,7 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
 
     def __init__(
         self,
-        vllm_config: VllmConfig,
+        vllm_config: "VllmConfig",
         role: KVConnectorRole,
         kv_cache_config: KVCacheConfig,
     ) -> None:
@@ -727,13 +724,7 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
         logger.info("%s initialized for mamba_cache_mode=all", type(self).__name__)
 
     def compute_block_hashes(self, group: MambaAllGroupInfo, request) -> list[bytes]:
-        if not _request_has_extra_hash_semantics(request):
-            return self.generate_hash(
-                group.block_size, request.all_token_ids, group.seed
-            )
-        return self.request_hasher.make_request_block_hasher(
-            group.block_size, group.seed
-        )(request)
+        return self.generate_hash(group.block_size, request.all_token_ids, group.seed)
 
     def generate_chunk_hash(self, token_ids):
         return self.request_hasher((self._seed, tuple(token_ids)))
@@ -797,9 +788,7 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
             }
         )
         self.requests_meta[request.request_id] = meta
-        # Content-only matching is not valid across LoRA, cache salt, images or
-        # prompt embeddings. Prefix hashing still handles those request types.
-        if not self.chunk_end_token_ids or _request_has_extra_hash_semantics(request):
+        if not self.chunk_end_token_ids:
             return matched, async_load
         meta.new_kv_cluster, meta.load_chunk_meta = self.get_kvbridge_matched_tokens(
             request,
@@ -1117,7 +1106,7 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
         self._kvb_rope[layer_name] = rope
         return rope
 
-    def start_load_kv(self, forward_context, **kwargs):
+    def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         metadata = self._get_connector_metadata()
         if metadata is self._kvb_processed_metadata:
             return
@@ -1187,7 +1176,9 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
                     "KVB postprocess failed for %s chunk %s: %s", job[0], job[1], exc
                 )
 
-    def _copy_temp_to_kvcaches(self, job, forward_context=None):
+    def _copy_temp_to_kvcaches(
+        self, job, forward_context: "ForwardContext" = None
+    ) -> None:
         _request_id, _chunk_index, request, chunk, group, ids = job
         cache_group = self._kv_cache_config.kv_cache_groups[group.group_id]
         spec_map = layer_name_to_kv_cache_spec(self._kv_cache_config)
