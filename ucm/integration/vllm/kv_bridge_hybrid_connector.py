@@ -22,7 +22,6 @@ from vllm.v1.kv_cache_interface import (
 )
 
 from ucm.integration.vllm.hla_connector import (
-    HLARequestDispatchMeta,
     HLARequestMeta,
     UCMHybridLinearAttentionConnector,
     block_size_from_kv_cache_spec,
@@ -414,7 +413,7 @@ class KVBRequestMeta(HLARequestMeta):
 
 
 @dataclass
-class KVBRequestDispatchMeta(HLARequestDispatchMeta):
+class KVBRequestDispatchMeta(RequestDispatchMeta):
     """下发本 step 的复用范围、完整物理 block 表和下一步 FA 加载计划。"""
     load_chunk_meta: list[LoadChunkMeta] = field(default_factory=list)
     mamba_load_chunk_meta: list[LoadChunkMeta] = field(default_factory=list)
@@ -1076,7 +1075,7 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
         need_load: bool = True,
         request_id: str = "",
         incoming_block_ids_are_full: bool = False,
-    ) -> RequestDispatchMeta:
+    ) -> KVBRequestDispatchMeta:
         """生成单请求本 step 的前缀加载、保存及 chunk 复用候选计划。"""
         manager: MambaAllGroupManager | None = self.group_manager  # type: ignore[assignment]
         assert manager is not None
@@ -1112,7 +1111,7 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
 
         # 只加载本地 HBM 命中终点之后、外部总命中终点之前的 prefix。
         if need_load and external_hit_lcm_blocks > 0:
-            # 加载列表先放 FA，父类按此分界处理 MLA 的 rank 分配。
+            # 加载列表先放 FA，再放 Mamba all-mode 状态。
             for group in manager.full_attn_groups:
                 self._append_block_range(
                     load_ucm_ids,
@@ -1125,7 +1124,6 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
                     group_id=group.group_id,
                     reason="load-attention",
                 )
-            load_full_attn_count = len(load_ucm_ids) if self.is_mla else 0
 
             # 加载所有命中的 Mamba blocks，保留后续 HBM 前缀复用所需的逐块状态。
             for group in manager.state_groups:
@@ -1140,8 +1138,6 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
                     group_id=group.group_id,
                     reason="load-mamba-all",
                 )
-        else:
-            load_full_attn_count = 0
 
         # 保存本步补齐的 blocks，末尾未完成的 block 留待后续 step。
         if req_meta.token_processed < req_meta.num_token_ids:
@@ -1163,7 +1159,6 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
                     group_id=group.group_id,
                     reason="dump-attention",
                 )
-            dump_full_attn_count = len(dump_ucm_ids) if self.is_mla else 0
 
             # all-mode 算子把每个已完成 block 的末尾状态写入对应物理槽位。
             for group in manager.state_groups:
@@ -1178,8 +1173,6 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
                     group_id=group.group_id,
                     reason="dump-mamba-all",
                 )
-        else:
-            dump_full_attn_count = 0
 
         step_start = req_meta.token_processed
         step_end = min(step_start + new_tokens, req_meta.num_token_ids)
@@ -1216,10 +1209,8 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
         req_meta.token_processed += new_tokens
 
         return KVBRequestDispatchMeta(
-            (load_ucm_ids, load_vllm_ids),
-            (dump_ucm_ids, dump_vllm_ids),
-            load_full_attn_count=load_full_attn_count,
-            dump_full_attn_count=dump_full_attn_count,
+            load_block_ids=(load_ucm_ids, load_vllm_ids),
+            dump_block_ids=(dump_ucm_ids, dump_vllm_ids),
             load_chunk_meta=chunks,
             mamba_load_chunk_meta=mamba_chunks,
             group_vllm_block_ids=[list(ids) for ids in req_meta.group_vllm_block_ids],
@@ -1277,14 +1268,15 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
         pending, failed = [], set()
         for job in jobs:
             request_id, chunk_index, request, chunk, group, ids = job
-            spec = self._kv_cache_config.kv_cache_groups[group.group_id].kv_cache_spec
-            fa_count = len(ids) if _is_full_attention_group(spec) and self.is_mla else 0
             keys = list(group.block_ids)
-            _, scoped, scoped_ids = self._scope_blocks(
-                keys, ids, fa_count, is_dump=False
+            # 普通 FA/GDN 各 TP rank 使用与保存端相同的分片哈希。
+            scoped = (
+                keys
+                if self.tp_rank % self.tp_size == 0
+                else [self.request_hasher(key) for key in keys]
             )
             try:
-                ptrs = self.kv_cache_layout_kvb.extract_block_addrs(scoped_ids)
+                ptrs = self.kv_cache_layout_kvb.extract_block_addrs(ids)
                 task = self._rank_consistency.submit_load(
                     self.store, {request_id: keys}, scoped, [0] * len(scoped), ptrs
                 )
