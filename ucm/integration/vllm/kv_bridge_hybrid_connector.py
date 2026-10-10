@@ -556,7 +556,7 @@ def _is_mamba_all_group(spec: KVCacheSpec) -> bool:
 
 
 @dataclass
-class MambaAllGroupInfo:
+class KVBHybridGroupInfo:
     """保存各缓存组的类型、block 大小、层名和独立 hash 种子。"""
     group_id: int
     block_size: int
@@ -570,7 +570,7 @@ class MambaAllGroupInfo:
         return not self.is_mamba_all
 
 
-class MambaAllGroupManager:
+class KVBHybridGroupManager:
     """管理 FA 与 all-mode Mamba 各组的 hash 和共同前缀命中。"""
 
     def __init__(
@@ -582,9 +582,9 @@ class MambaAllGroupManager:
         self.connector = connector
         request_hasher = connector.request_hasher
         base_seed = connector._seed
-        self.groups_by_id: list[MambaAllGroupInfo] = []
-        self.full_attn_groups: list[MambaAllGroupInfo] = []
-        self.state_groups: list[MambaAllGroupInfo] = []
+        self.groups_by_id: list[KVBHybridGroupInfo] = []
+        self.full_attn_groups: list[KVBHybridGroupInfo] = []
+        self.state_groups: list[KVBHybridGroupInfo] = []
 
         for group_id, group in enumerate(kv_cache_config.kv_cache_groups):
             spec = group.kv_cache_spec
@@ -597,7 +597,7 @@ class MambaAllGroupManager:
                     f"MambaSpec(mamba_cache_mode='all'); group={group_id}, spec={spec}"
                 )
 
-            info = MambaAllGroupInfo(
+            info = KVBHybridGroupInfo(
                 group_id=group_id,
                 block_size=block_size_from_kv_cache_spec(spec),
                 layer_names=tuple(group.layer_names),
@@ -631,7 +631,7 @@ class MambaAllGroupManager:
         self.lcm_block_size = self.block_size
 
         logger.info(
-            "MambaAllGroupManager initialized: mamba_block_size=%s, block_size=%s",
+            "KVBHybridGroupManager initialized: mamba_block_size=%s, block_size=%s",
             mamba_block_size,
             attention_block_size,
         )
@@ -641,10 +641,10 @@ class MambaAllGroupManager:
         """返回缓存组数量，供 block 表和 dispatch 检查使用。"""
         return len(self.groups_by_id)
 
-    def compute_all_group_block_ids(self, request) -> list[list[bytes]]:
-        """使用各组独立种子，为请求生成所有组的存储 block hashes。"""
+    def compute_all_group_block_ids(self, token_ids: list[int]) -> list[list[bytes]]:
+        """使用各组独立种子，为 token 序列生成所有组的存储 block hashes。"""
         return [
-            self.connector.compute_block_hashes(g, request) for g in self.groups_by_id
+            self.connector.compute_block_hashes(g, token_ids) for g in self.groups_by_id
         ]
 
     def lookup_external_hit_tokens(
@@ -785,7 +785,7 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
         self._kvb_processed_metadata = None
 
         if role == KVConnectorRole.SCHEDULER:
-            self.group_manager = MambaAllGroupManager(
+            self.group_manager = KVBHybridGroupManager(
                 kv_cache_config=kv_cache_config,
                 connector=self,
             )
@@ -812,9 +812,11 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
             dtype=torch.float32,
         )
 
-    def compute_block_hashes(self, group: MambaAllGroupInfo, request) -> list[bytes]:
+    def compute_block_hashes(
+        self, group: KVBHybridGroupInfo, token_ids: list[int]
+    ) -> list[bytes]:
         """沿用 KVB token hash 链，使用当前缓存组的独立种子。"""
-        return self.generate_hash(group.block_size, request.all_token_ids, group.seed)
+        return self.generate_hash(group.block_size, token_ids, group.seed)
 
     def generate_chunk_hash(self, token_ids):
         """仅按种子和 chunk 内容生成 hash，支持不同位置的内容匹配。"""
@@ -1076,7 +1078,7 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
         incoming_block_ids_are_full: bool = False,
     ) -> KVBRequestDispatchMeta:
         """生成单请求本 step 的前缀加载、保存及 chunk 复用候选计划。"""
-        manager: MambaAllGroupManager | None = self.group_manager  # type: ignore[assignment]
+        manager: KVBHybridGroupManager | None = self.group_manager  # type: ignore[assignment]
         assert manager is not None
 
         if len(new_vllm_block_ids_per_group) != manager.num_groups:
