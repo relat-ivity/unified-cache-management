@@ -2,6 +2,7 @@ import math
 from collections import OrderedDict, defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
+from types import SimpleNamespace
 from typing import ClassVar
 
 import numpy as np
@@ -22,13 +23,13 @@ from vllm.v1.kv_cache_interface import (
 )
 
 from ucm.integration.vllm.hla_connector import (
+    HLARequestDispatchMeta,
     HLARequestMeta,
     UCMHybridLinearAttentionConnector,
     block_size_from_kv_cache_spec,
     layer_name_to_kv_cache_spec,
 )
 from ucm.integration.vllm.ucm_connector import (
-    RequestDispatchMeta,
     RequestHasher,
     UCMDirectConnector,
     _record_counter,
@@ -413,8 +414,9 @@ class KVBRequestMeta(HLARequestMeta):
 
 
 @dataclass
-class KVBRequestDispatchMeta(RequestDispatchMeta):
+class KVBRequestDispatchMeta(HLARequestDispatchMeta):
     """下发本 step 的复用范围、完整物理 block 表和下一步 FA 加载计划。"""
+
     load_chunk_meta: list[LoadChunkMeta] = field(default_factory=list)
     mamba_load_chunk_meta: list[LoadChunkMeta] = field(default_factory=list)
     group_vllm_block_ids: list[list[int]] = field(default_factory=list)
@@ -563,6 +565,7 @@ class MambaAllGroupInfo:
     layer_names: tuple[str, ...]
     seed: bytes
     is_mamba_all: bool
+    block_hasher: Callable
 
     @property
     def is_full_attention(self) -> bool:
@@ -580,8 +583,8 @@ class MambaAllGroupManager:
     ) -> None:
         """划分 FA 与 Mamba 组，并要求所有组使用相同 block 大小。"""
         self.connector = connector
-        request_hasher = RequestHasher(connector._vllm_config, 0)
-        base_seed = request_hasher.seed
+        request_hasher = connector.request_hasher
+        base_seed = connector._seed
         self.groups_by_id: list[MambaAllGroupInfo] = []
         self.full_attn_groups: list[MambaAllGroupInfo] = []
         self.state_groups: list[MambaAllGroupInfo] = []
@@ -597,12 +600,16 @@ class MambaAllGroupManager:
                     f"MambaSpec(mamba_cache_mode='all'); group={group_id}, spec={spec}"
                 )
 
+            seed = request_hasher((b"UCM_GROUP_SEED", base_seed, group_id))
             info = MambaAllGroupInfo(
                 group_id=group_id,
                 block_size=block_size_from_kv_cache_spec(spec),
                 layer_names=tuple(group.layer_names),
-                seed=request_hasher((b"UCM_GROUP_SEED", base_seed, group_id)),
+                seed=seed,
                 is_mamba_all=is_mamba_all,
+                block_hasher=request_hasher.make_request_block_hasher(
+                    block_size_from_kv_cache_spec(spec), seed
+                ),
             )
             self.groups_by_id.append(info)
             if is_mamba_all:
@@ -814,8 +821,8 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
         )
 
     def compute_block_hashes(self, group: MambaAllGroupInfo, request) -> list[bytes]:
-        """沿用 KVB token hash 链，使用当前缓存组的独立种子。"""
-        return self.generate_hash(group.block_size, request.all_token_ids, group.seed)
+        """使用当前 UCM request block hasher，保留 extra keys 与各组种子。"""
+        return group.block_hasher(request)
 
     def generate_chunk_hash(self, token_ids):
         """仅按种子和 chunk 内容生成 hash，支持不同位置的内容匹配。"""
@@ -857,6 +864,14 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
 
     def get_kvbridge_matched_tokens(self, request, group_block_ids, prefix_hit_len):
         """构建当前 cluster，并与最佳历史 cluster 检查 FA、Mamba 命中。"""
+        # 内容匹配没有历史请求的 extra keys；这些请求仅沿用正常 prefix 路径。
+        if (
+            getattr(request, "mm_features", None)
+            or getattr(request, "lora_request", None) is not None
+            or getattr(request, "cache_salt", None)
+            or getattr(request, "prompt_embeds", None) is not None
+        ):
+            return None, [], []
         info, best_id = self._process_req(
             request.all_token_ids, group_block_ids, prefix_hit_len, request.request_id
         )
@@ -937,7 +952,15 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
                     new_start + next_block_offset : new_start + old.chunk_lens[key]
                 ]
                 # 用相同 chunk 的当前 tokens 和历史起始 hash 还原历史 hash 链。
-                hashes = [anchor] + list(self.generate_hash(bs, tokens, anchor))
+                continuation = self.request_hasher.make_request_block_hasher(bs, anchor)
+                plain_request = SimpleNamespace(
+                    all_token_ids=tokens,
+                    mm_features=[],
+                    lora_request=None,
+                    cache_salt=None,
+                    prompt_embeds=None,
+                )
+                hashes = [anchor] + continuation(plain_request)
                 skip = first - anchor_index
                 count = (offset + length + bs - 1) // bs
                 # ids 是覆盖源 token 范围的存储 hashes，不是物理 block IDs。
@@ -1111,7 +1134,7 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
 
         # 只加载本地 HBM 命中终点之后、外部总命中终点之前的 prefix。
         if need_load and external_hit_lcm_blocks > 0:
-            # 加载列表先放 FA，再放 Mamba all-mode 状态。
+            # 加载列表先放 FA，沿用 HLA 的 MLA/状态分界。
             for group in manager.full_attn_groups:
                 self._append_block_range(
                     load_ucm_ids,
@@ -1124,6 +1147,7 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
                     group_id=group.group_id,
                     reason="load-attention",
                 )
+            load_full_attn_count = len(load_ucm_ids) if self.is_mla else 0
 
             # 加载所有命中的 Mamba blocks，保留后续 HBM 前缀复用所需的逐块状态。
             for group in manager.state_groups:
@@ -1138,6 +1162,8 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
                     group_id=group.group_id,
                     reason="load-mamba-all",
                 )
+        else:
+            load_full_attn_count = 0
 
         # 保存本步补齐的 blocks，末尾未完成的 block 留待后续 step。
         if req_meta.token_processed < req_meta.num_token_ids:
@@ -1159,6 +1185,7 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
                     group_id=group.group_id,
                     reason="dump-attention",
                 )
+            dump_full_attn_count = len(dump_ucm_ids) if self.is_mla else 0
 
             # all-mode 算子把每个已完成 block 的末尾状态写入对应物理槽位。
             for group in manager.state_groups:
@@ -1173,6 +1200,8 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
                     group_id=group.group_id,
                     reason="dump-mamba-all",
                 )
+        else:
+            dump_full_attn_count = 0
 
         step_start = req_meta.token_processed
         step_end = min(step_start + new_tokens, req_meta.num_token_ids)
@@ -1211,6 +1240,8 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
         return KVBRequestDispatchMeta(
             load_block_ids=(load_ucm_ids, load_vllm_ids),
             dump_block_ids=(dump_ucm_ids, dump_vllm_ids),
+            load_full_attn_count=load_full_attn_count,
+            dump_full_attn_count=dump_full_attn_count,
             load_chunk_meta=chunks,
             mamba_load_chunk_meta=mamba_chunks,
             group_vllm_block_ids=[list(ids) for ids in req_meta.group_vllm_block_ids],
@@ -1268,17 +1299,16 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
         pending, failed = [], set()
         for job in jobs:
             request_id, chunk_index, request, chunk, group, ids = job
+            spec = self._kv_cache_config.kv_cache_groups[group.group_id].kv_cache_spec
+            fa_count = len(ids) if _is_full_attention_group(spec) and self.is_mla else 0
             keys = list(group.block_ids)
-            # 普通 FA/GDN 各 TP rank 使用与保存端相同的分片哈希。
-            scoped = (
-                keys
-                if self.tp_rank % self.tp_size == 0
-                else [self.request_hasher(key) for key in keys]
+            rank0_keys, scoped, scoped_ids = self._scope_blocks(
+                keys, ids, fa_count, is_dump=False
             )
             try:
-                ptrs = self.kv_cache_layout_kvb.extract_block_addrs(ids)
+                ptrs = self.kv_cache_layout_kvb.extract_block_addrs(scoped_ids)
                 task = self._rank_consistency.submit_load(
-                    self.store, {request_id: keys}, scoped, [0] * len(scoped), ptrs
+                    self.store, {request_id: rank0_keys}, scoped, [0] * len(scoped), ptrs
                 )
                 pending.append((job, task))
             except Exception as exc:  # noqa: BLE001 - 提交失败仍需等待其他已提交任务
