@@ -791,7 +791,6 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
             )
             self.block_size = self.group_manager.block_size
             self.hash_block_size = self.group_manager.block_size
-            self._bind_request_block_hasher()
 
         logger.info("%s initialized for mamba_cache_mode=all", type(self).__name__)
 
