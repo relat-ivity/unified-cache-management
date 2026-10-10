@@ -580,8 +580,8 @@ class MambaAllGroupManager:
     ) -> None:
         """划分 FA 与 Mamba 组，并要求所有组使用相同 block 大小。"""
         self.connector = connector
-        request_hasher = RequestHasher(connector._vllm_config, 0)
-        base_seed = request_hasher.seed
+        request_hasher = connector.request_hasher
+        base_seed = connector._seed
         self.groups_by_id: list[MambaAllGroupInfo] = []
         self.full_attn_groups: list[MambaAllGroupInfo] = []
         self.state_groups: list[MambaAllGroupInfo] = []
