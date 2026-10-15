@@ -1039,7 +1039,15 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
                         return 0, ()
                     ids = [preceding] + ids
                 # lookup 返回连续命中的最后下标，-1 表示未命中，+1 转为块数。
-                hits = max(0, min(len(ids), lookup(list(ids)) + 1))
+                lookup_result = lookup(list(ids))
+                hits = max(0, min(len(ids), lookup_result + 1))
+                logger.info(
+                    "KVB lookup keys request=%s history_request=%s kind=%s group=%s "
+                    "keys=%s lookup_result=%s",
+                    new_cluster.request_id, best_cluster.request_id,
+                    "mamba" if group.is_mamba_all else "fa", group.group_id,
+                    [key.hex() for key in ids], lookup_result,
+                )
                 # 前置 checkpoint 和源 block 内偏移不计入可复用 token 数。
                 available = max(0, (hits - int(previous)) * bs - offset)
                 requested_length = length
@@ -1190,6 +1198,13 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
             )
 
         # 物理 block 0 是有效缓存地址，不能在追加时过滤。
+        logger.info(
+            "KVB dispatch keys request=%s group=%s operation=%s "
+            "blocks(logical,key,physical)=%s",
+            request_id, group_id, reason,
+            [(start_block + i, key.hex(), slot)
+             for i, (key, slot) in enumerate(zip(ucm_slice, vllm_slice))],
+        )
         dst_ucm_ids.extend(ucm_slice)
         dst_vllm_ids.extend(vllm_slice)
 

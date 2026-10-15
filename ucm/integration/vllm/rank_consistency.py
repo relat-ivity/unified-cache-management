@@ -117,7 +117,14 @@ class RankConsistencyManager:
         if not self.enabled:
             return store.lookup_on_prefix(block_ids)
         if self._tracker is not None:
-            block_ids = self._tracker.valid_prefix(block_ids)
+            valid_ids = self._tracker.valid_prefix(block_ids)
+            if len(valid_ids) != len(block_ids):
+                logger.info(
+                    "UCM lookup filtered reason=rank_inconsistent "
+                    "first_blocked_key=%s requested_blocks=%s allowed_blocks=%s",
+                    block_ids[len(valid_ids)].hex(), len(block_ids), len(valid_ids),
+                )
+            block_ids = valid_ids
         if not block_ids:
             return -1
         return store.lookup_on_prefix(block_ids)
@@ -236,6 +243,10 @@ class RankConsistencyManager:
             self._record_dump_failure(request_context)
             raise
         self._dump_task_contexts[id(task)] = (store, request_context)
+        logger.info(
+            "UCM dump submitted task=%s requests=%s blocks=%s",
+            id(task), list(block_ids_by_request), len(block_ids),
+        )
         return task
 
     def wait_dump(self, task: Any) -> None:
@@ -246,12 +257,24 @@ class RankConsistencyManager:
         store, request_context = self._dump_task_contexts.pop(task_key)
         try:
             store.wait(task)
-        except StoreUnhealthyError:
+        except StoreUnhealthyError as error:
+            logger.warning(
+                "UCM dump failed task=%s requests=%s reason=store_unhealthy error=%s",
+                task_key, list(request_context), error,
+            )
             self._record_dump_failure(request_context)
             return
-        except Exception:
+        except Exception as error:
+            logger.warning(
+                "UCM dump failed task=%s requests=%s error=%s: %s",
+                task_key, list(request_context), type(error).__name__, error,
+            )
             self._record_dump_failure(request_context)
             raise
+        logger.info(
+            "UCM dump completed task=%s requests=%s",
+            task_key, list(request_context),
+        )
 
     def finish_dump(self, request_ids: set[str]) -> None:
         """Queue successful blocks for reporting to scheduler."""
