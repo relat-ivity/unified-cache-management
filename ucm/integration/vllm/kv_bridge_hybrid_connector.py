@@ -518,28 +518,99 @@ def denoise_gdn(states, g, initial_state=None):
 
 
 def get_attention_kv_views(cache, spec, num_blocks):
-    """兼容分离或合并的 K/V 缓存，统一返回 [blocks, tokens, heads, dim] 视图。"""
+    """返回逻辑 block 的 K/V 视图，合并 Ascend 的 128-token 虚拟 blocks。"""
     if isinstance(cache, (tuple, list)):
         if len(cache) != 2:
             raise ValueError("Full Attention requires separate K and V components")
         parts = cache
-    elif cache.ndim == 5 and cache.shape[0] == 2 and cache.shape[1] == num_blocks:
+    elif isinstance(cache, torch.Tensor) and cache.ndim == 5 and cache.shape[0] == 2:
         parts = (cache[0], cache[1])
-    elif cache.ndim == 5 and cache.shape[0] == num_blocks and cache.shape[1] == 2:
+    elif isinstance(cache, torch.Tensor) and cache.ndim == 5 and cache.shape[1] == 2:
         parts = (cache[:, 0], cache[:, 1])
     else:
         raise ValueError("unsupported Full Attention cache axes")
     result = []
-    for tensor in parts:
-        if tensor.ndim != 4 or tensor.shape[0] != num_blocks:
-            raise ValueError("expected four-dimensional paged K/V")
+    for index, tensor in enumerate(parts):
+        if not isinstance(tensor, torch.Tensor):
+            raise TypeError("K/V cache components must be tensors")
+        head_dim = (
+            spec.head_size
+            if index == 0
+            else getattr(spec, "head_size_v", spec.head_size)
+        )
+        # Some Ascend entry points flatten the head and feature dimensions.
+        if tensor.ndim == 3 and tensor.shape[-1] == spec.num_kv_heads * head_dim:
+            tensor = tensor.view(*tensor.shape[:2], spec.num_kv_heads, head_dim)
+        if tensor.ndim != 4 or tensor.shape[-1] != head_dim:
+            raise ValueError(
+                f"Unsupported K/V cache shape {tuple(tensor.shape)} for head_dim={head_dim}"
+            )
         if tensor.shape[1:3] == (spec.block_size, spec.num_kv_heads):
-            result.append(tensor)
+            logical = tensor
         elif tensor.shape[1:3] == (spec.num_kv_heads, spec.block_size):
-            result.append(tensor.transpose(1, 2))
+            logical = tensor.transpose(1, 2)
+        elif (
+            tensor.shape[1] > 0
+            and tensor.shape[2] == spec.num_kv_heads
+            and spec.block_size % tensor.shape[1] == 0
+        ):
+            # The runner exposes [N * chunks, kernel_block_size, H, D], while
+            # KVB block tables and storage addresses use logical block IDs.
+            chunks = spec.block_size // tensor.shape[1]
+            if tensor.shape[0] % chunks:
+                raise ValueError(
+                    f"K/V virtual blocks do not form complete {spec.block_size}-token blocks"
+                )
+            try:
+                logical = tensor.view(
+                    tensor.shape[0] // chunks,
+                    spec.block_size,
+                    spec.num_kv_heads,
+                    head_dim,
+                )
+            except RuntimeError as exc:
+                raise ValueError(
+                    "K/V virtual blocks cannot be grouped into a writable logical view"
+                ) from exc
         else:
-            raise ValueError("K/V token/head axes disagree with FullAttentionSpec")
+            raise ValueError(
+                f"K/V shape {tuple(tensor.shape)} disagrees with block_size={spec.block_size}"
+            )
+        if logical.shape[0] < num_blocks:
+            raise ValueError(
+                f"K/V cache has {logical.shape[0]} logical blocks, requiring at least {num_blocks}"
+            )
+        result.append(logical)
+    if result[0].shape[0] != result[1].shape[0]:
+        raise ValueError("K and V cache logical block counts disagree")
     return tuple(result)
+
+
+def get_mamba_state_views(cache, block_size, num_blocks):
+    """校验实际注册的 g sidecar，禁止把缺失 g 的两状态缓存用于拼接。"""
+    if not isinstance(cache, (tuple, list)) or len(cache) != 3:
+        count = len(cache) if isinstance(cache, (tuple, list)) else type(cache).__name__
+        raise ValueError(
+            f"KVB GDN reuse requires three cache components [conv, SSM, g]; got {count}. "
+            "Refresh the g enable flag after restoring mamba_cache_mode='all', before cache registration."
+        )
+    conv, state, g = cache
+    if not all(isinstance(t, torch.Tensor) for t in cache):
+        raise TypeError("Mamba cache components must be tensors")
+    if state.ndim < 3 or conv.ndim < 2 or g.ndim != 3:
+        raise ValueError(
+            "KVB requires Conv/SSM state pools and g [blocks, tokens, heads]"
+        )
+    if g.shape[1:] != (block_size, state.shape[1]):
+        raise ValueError("registered g must have shape [blocks, block_size, heads]")
+    if (
+        min(t.shape[0] for t in cache) < num_blocks
+        or len({t.shape[0] for t in cache}) != 1
+    ):
+        raise ValueError(
+            "Conv, SSM and g physical block counts disagree with the cache configuration"
+        )
+    return conv, state, g
 
 
 def _concrete_specs(spec: KVCacheSpec) -> list[KVCacheSpec]:
@@ -566,6 +637,7 @@ def _is_mamba_all_group(spec: KVCacheSpec) -> bool:
 @dataclass
 class KVBHybridGroupInfo:
     """保存各缓存组的类型、block 大小、层名和独立 hash 种子。"""
+
     group_id: int
     block_size: int
     layer_names: tuple[str, ...]
@@ -804,7 +876,44 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """注册正常缓存，并建立 chunk 临时布局和 FP32 RoPE 修正缓存。"""
-        super().register_kv_caches(kv_caches)
+        # Normalize only connector-owned views; the Attention backend keeps
+        # its original kernel-block views of the same storage.
+        normalized = dict(kv_caches)
+        spec_map = layer_name_to_kv_cache_spec(self._kv_cache_config)
+        fa_count = state_count = 0
+        for name, cache in kv_caches.items():
+            spec = spec_map[name][0]
+            if isinstance(spec, FullAttentionSpec) and not isinstance(
+                spec, MLAAttentionSpec
+            ):
+                normalized[name] = get_attention_kv_views(
+                    cache, spec, self._kv_cache_config.num_blocks
+                )
+                if fa_count == 0:
+                    original = cache if isinstance(cache, (tuple, list)) else (cache,)
+                    logger.info(
+                        "KVB FA cache view layer=%s original_shapes=%s logical_shapes=%s",
+                        name,
+                        [tuple(t.shape) for t in original],
+                        [tuple(t.shape) for t in normalized[name]],
+                    )
+                fa_count += 1
+            elif isinstance(spec, MambaSpec) and self.chunk_end_token_ids:
+                try:
+                    normalized[name] = get_mamba_state_views(
+                        cache, spec.block_size, self._kv_cache_config.num_blocks
+                    )
+                except (ValueError, TypeError) as exc:
+                    raise ValueError(
+                        f"Cannot register KVB Mamba layer {name}: {exc}"
+                    ) from exc
+                state_count += 1
+        super().register_kv_caches(normalized)
+        logger.info(
+            "KVB registered logical cache views: FA layers=%s, Mamba layers with g=%s",
+            fa_count,
+            state_count,
+        )
         self.kv_cache_layout_kvb = KVCacheLayoutKVB(
             self.kv_cache_layout, self.kv_caches
         )
@@ -1522,9 +1631,9 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
         """去除历史入口贡献并重定本段入口，保留 conv、原始 g 和源状态。"""
         request_id, chunk_index, request, chunk, group, ids = job
         # writer 依次注册 conv、recurrent state、原始 g，视图偏移和步长沿用注册布局。
-        conv, state, g = self.kv_caches[name]
-        if g.shape[1:] != (group.block_size, state.shape[1]):
-            raise ValueError("registered g must have shape [blocks, block_size, heads]")
+        conv, state, g = get_mamba_state_views(
+            self.kv_caches[name], group.block_size, self._kv_cache_config.num_blocks
+        )
         state_view = self.kv_cache_layout_kvb.tensor_view(name, state)[
             ids[0] : ids[-1] + 1
         ]
