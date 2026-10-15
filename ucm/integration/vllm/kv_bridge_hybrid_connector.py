@@ -956,6 +956,23 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
                 continue
             # 仅登记 END 结束且不少于 512 token 的 chunk。
             if end + 1 - start >= MIN_CHUNK_LEN:
+                # Hash lists contain complete blocks only. A chunk starting
+                # in the final partial block has no hash to index/reuse.
+                missing_groups = [
+                    g.group_id
+                    for g in self.group_manager.groups_by_id
+                    if g.group_id >= len(group_block_ids)
+                    or start // g.block_size >= len(group_block_ids[g.group_id])
+                ]
+                if missing_groups:
+                    logger.info(
+                        "KVB chunk skip request=%s start=%s end=%s tokens=%s "
+                        "reason=missing_start_block_hash groups=%s block_hash_counts=%s",
+                        request_id, start, end + 1, end + 1 - start,
+                        missing_groups, [len(ids) for ids in group_block_ids],
+                    )
+                    start = end + 1
+                    continue
                 key = self.generate_chunk_hash(all_token_ids[start : end + 1])
                 logger.info(
                     "KVB chunk request=%s start=%s end=%s tokens=%s hash=%s "
