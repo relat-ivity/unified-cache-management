@@ -2093,7 +2093,7 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
         reused = sum(int(mask.sum()) for mask in context.kvb_gdn_masks.values())
         if reused:
             logger.info(
-                "KVB GDN forward reuses %s tokens (source-block aligned)", reused
+                "KVB GDN reuse plan tokens=%s (source-block aligned; pending layer execution)", reused
             )
 
     def clear_connector_metadata(self):
