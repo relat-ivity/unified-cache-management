@@ -415,7 +415,7 @@ class LoadChunkMeta:
 class KVBRequestMeta(HLARequestMeta):
     """在 HLA 请求状态上增加当前 cluster 和 FA、Mamba 命中信息。"""
     new_kv_cluster: KVCluster | None = None
-    # FA 按目标 block 对齐，Mamba 按源 block 对齐，命中范围分别保存。
+    # 两者按完整源 checkpoint block 选取，目标位置允许块内偏移。
     load_chunk_meta: list[LoadChunkMeta] = field(default_factory=list)
     mamba_load_chunk_meta: list[LoadChunkMeta] = field(default_factory=list)
 
@@ -485,11 +485,11 @@ def build_step_mamba_chunk_metadata(chunks, start, end, block_size, logits_limit
         for index in range(first, max(first, stop)):
             target = origin + index * block_size
             last = target + block_size
-            # 保留 logits block；本步非目标块边界结束时保守限制新增复用。
+            # 保留 logits token；偏移 checkpoint 后须留下正常计算以保存续接状态。
             if last > logits_limit or (
                 target >= start
                 and end % block_size
-                and last > end // block_size * block_size
+                and last >= end
             ):
                 continue
             result.extend(
@@ -860,6 +860,8 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
         # 跨步状态独立于临时加载视图，不能在每步清理时无条件释放。
         self.kvb_cross_step_states = {}
         self.kvb_next_step_fa_cache = {}
+        self.kvb_fa_cache = {}
+        self._kvb_fa_context = None
         self._kvb_restored_cross_step_states = {}
         self.rotary_emb_3d = None
         self._kvb_processed_metadata = None
@@ -1224,11 +1226,11 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
                 continue
             dst = current.chunk_start_positions[key]
             src = old.chunk_start_positions[key]
-            # FA 目标起点向上对齐；源起点同步移动，保持 token 内容对应。
-            lead = (-dst) % self.block_size
+            # 先选完整源 checkpoint，目标同步移动，保留块内偏移。
+            lead = (-src) % self.block_size
             src, dst = src + lead, dst + lead
             length = min(current.chunk_lens[key], old.chunk_lens[key]) - lead
-            # 目标终点向下对齐，例如 block3+30 到 block6+100 只复用块4、5。
+            # 不再先裁目标整块，否则会丢掉可用的源 checkpoint。
             length = length // self.block_size * self.block_size
             logger.info(
                 "KVB align request=%s hash=%s kind=fa original_src=%s "
@@ -1241,11 +1243,11 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
             if length <= 0:
                 logger.info(
                     "KVB range reject request=%s hash=%s kind=fa "
-                    "reason=no_complete_target_block",
+                    "reason=no_complete_source_block",
                     new_cluster.request_id, key.hex(),
                 )
                 continue
-            # 先确认所有 FA 组的缓存存在，再保留实际可用的目标对齐范围。
+            # K/V 加载范围和 GDN 跳过范围分别检查，缺失状态不能发布跳过。
             length, groups = verify_range(key, src, length, fa_groups)
             if not length:
                 continue
@@ -1443,11 +1445,11 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
 
         step_start = req_meta.token_processed
         step_end = min(step_start + new_tokens, req_meta.num_token_ids)
+        logits_limit = req_meta.num_token_ids - 1
         chunks = build_step_chunk_metadata(
-            getattr(req_meta, "load_chunk_meta", []), step_start, step_end, block_size
+            getattr(req_meta, "load_chunk_meta", []),
+            step_start, min(step_end, logits_limit), 1,
         )
-        # 最后一个 prompt block 必须保留正常计算，才能产生有效 logits。
-        logits_limit = (req_meta.num_token_ids - 1) // block_size * block_size
         mamba_chunks = build_step_mamba_chunk_metadata(
             getattr(req_meta, "mamba_load_chunk_meta", []),
             step_start,
@@ -1455,7 +1457,7 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
             block_size,
             logits_limit,
         )
-        # GDN 提前组合跨步源 block 时，还需预加载下一整个目标 FA block。
+        # GDN 提前组合时只预留超出本步的 K/V，不要求下一整个目标块。
         future_fa = []
         for chunk in mamba_chunks:
             first = chunk.destination_start + chunk.output_offset
@@ -1468,8 +1470,8 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
                             if fa.chunk_hash == chunk.chunk_hash
                         ],
                         step_end,
-                        step_end + block_size,
-                        block_size,
+                        first + chunk.output_length,
+                        1,
                     )
                 )
         # 推进 scheduler 已下发计划的位置，尚不代表 worker 已完成计算。
@@ -1497,6 +1499,10 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
         if not hasattr(self, "kvb_cross_step_states"):
             self.kvb_cross_step_states = {}
         self.kvb_next_step_fa_cache = {}
+        self.kvb_fa_cache = {}
+        self._kvb_fa_context = forward_context
+        if forward_context is not None:
+            forward_context.kvb_fa_reuse = {}
         self._kvb_restored_cross_step_states = {}
         for request_id in getattr(metadata, "preempted_req_ids", ()):
             self.kvb_cross_step_states.pop(request_id, None)
@@ -1611,38 +1617,46 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
             )
             start = chunk.destination_start + chunk.output_offset
             length = chunk.output_length
-            if start % group.block_size or length <= 0 or length % group.block_size:
-                raise ValueError("KVB destination must cover complete aligned blocks")
+            if start < 0 or length <= 0:
+                raise ValueError("KVB destination must cover a positive token range")
             first_block = start // group.block_size
             blocks = request.group_vllm_block_ids[group.group_id]
-            n = length // group.block_size
+            stop_block = (start + length + group.block_size - 1) // group.block_size
+            n = stop_block - first_block
             if not is_next_step_fa_chunk and (first_block < 0 or first_block + n > len(blocks)):
                 raise ValueError("KVB destination outside allocated block table")
-            dst_ids = blocks[first_block : first_block + n]
+            if not is_next_step_fa_chunk and any(
+                slot < 0 or slot >= key.shape[0]
+                for slot in blocks[first_block:stop_block]
+            ):
+                raise ValueError("KVB destination outside allocated block table")
             offset = group.source_offset + chunk.output_offset
             staging = self.kv_cache_layout_kvb
             temp_k = staging.tensor_view(name, key)[ids[0] : ids[-1] + 1]
             temp_v = staging.tensor_view(name, value)[ids[0] : ids[-1] + 1]
             src_k = temp_k.reshape(-1, *key.shape[2:])[offset : offset + length]
             src_v = temp_v.reshape(-1, *value.shape[2:])[offset : offset + length]
+            if src_k.shape[0] != length or src_v.shape[0] != length:
+                raise ValueError("KVB source range outside loaded K/V")
             # K 按目标减源的位置差旋转，V 保留原值。
             if chunk.shift:
                 delta_positions = torch.full(
                     (length,), chunk.shift, dtype=torch.long, device=key.device
                 )
                 src_k = self.rotary_emb_3d.shift(src_k, delta_positions)
-            # 两个视图均通过计算和形状校验后，再写目标 K/V。
-            src_k = src_k.reshape(n, group.block_size, *key.shape[2:])
-            src_v = src_v.reshape(n, group.block_size, *value.shape[2:])
-            # 下一步物理 block 可能尚未分配，先持有修正后 K/V 的独立副本。
+            # 拥有独立副本，禁止提前按整块覆盖目标缓存；FA 在投影后合并。
+            src_k, src_v = src_k.clone(), src_v.clone()
             if is_next_step_fa_chunk:
                 future = self.kvb_next_step_fa_cache.setdefault(
                     (request_id, chunk.chunk_hash, start), {}
                 )
-                future[name] = (src_k.clone(), src_v.clone())
+                future[name] = (src_k, src_v)
             else:
-                key[dst_ids] = src_k
-                value[dst_ids] = src_v
+                if not hasattr(self, "kvb_fa_cache"):
+                    self.kvb_fa_cache = {}
+                self.kvb_fa_cache[request_id, chunk_index, name] = {
+                    "start": start, "key": src_k, "value": src_v,
+                }
 
     def _denoise_mamba_chunk(self, name, job):
         """去除历史入口贡献并重定本段入口，保留 conv、原始 g 和源状态。"""
@@ -1752,6 +1766,26 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
                 "KVB continuation is incomplete or inconsistent across TP ranks"
             )
 
+    def _fa_reuse_supported(self, context, fa_names):
+        """Reject unsupported FA paths before any GDN skip plan is published."""
+        try:
+            from vllm_ascend.attention.attention_v1 import supports_kvb_fa_reuse
+        except ImportError:
+            return False
+
+        config = getattr(self, "_vllm_config", None)
+        layers = getattr(getattr(config, "compilation_config", None), "static_forward_context", {})
+        return bool(fa_names) and all(
+            name in layers
+            and name in context.attn_metadata
+            and name in self.kv_caches
+            and len(self.kv_caches[name]) == 2
+            and all(part.dtype == torch.bfloat16 for part in self.kv_caches[name])
+            and self.kv_caches[name][0].shape == self.kv_caches[name][1].shape
+            and supports_kvb_fa_reuse(getattr(layers[name], "impl", None), context.attn_metadata[name])
+            for name in fa_names
+        )
+
     def _restore_cross_step_states(self, context, metadata, names, fa_ids, block_size):
         """恢复已提交跨步状态及预留 FA 缓存，发布本 step 的前缀复用信息。"""
         inputs = context.kvb_gdn_inputs
@@ -1779,7 +1813,7 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
                     for c in getattr(request, "mamba_load_chunk_meta", ())
                 )
             )
-            writes = []
+            fa_payload = []
             if valid:
                 for name in names:
                     meta = context.attn_metadata.get(name)
@@ -1793,8 +1827,8 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
                         break
                 for gid in fa_ids:
                     group = self._kv_cache_config.kv_cache_groups[gid]
-                    # 使用本 step 最新物理表，不能沿用上一步尚未分配的 block 地址。
-                    block = cross_step_state["fa_start"] // block_size
+                    # 只验证本步最新物理表，真正写入由 FA 的 slot_mapping 完成。
+                    block = start // block_size
                     table = request.group_vllm_block_ids[gid]
                     if block >= len(table) or table[block] < 0:
                         valid = False
@@ -1803,33 +1837,41 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
                         if name not in cross_step_state["fa"] or name not in self.kv_caches:
                             valid = False
                             break
-                        key, value = get_attention_kv_views(
+                        key, _value = get_attention_kv_views(
                             self.kv_caches[name],
                             group.kv_cache_spec,
                             self._kv_cache_config.num_blocks,
                         )
                         cached_k, cached_v = cross_step_state["fa"][name]
-                        slot = table[block]
+                        limit = min(end, cross_step_state["fa_start"] + cached_k.shape[0])
+                        stop_block = (limit + block_size - 1) // block_size
                         if (
-                            slot >= key.shape[0]
-                            or slot >= value.shape[0]
-                            or cached_k.shape != (1, *key.shape[1:])
-                            or cached_v.shape != (1, *value.shape[1:])
+                            cached_k.ndim != 3
+                            or cached_k.shape[1:] != key.shape[2:]
+                            or cached_v.shape != cached_k.shape
+                            or cross_step_state["fa_start"] + cached_k.shape[0] < terminal
+                            or stop_block > len(table)
+                            or any(slot < 0 or slot >= key.shape[0] for slot in table[block:stop_block])
                         ):
                             valid = False
                             break
-                        writes.append((key, value, slot, cached_k, cached_v))
+                        fa_payload.append((name, {
+                            "start": cross_step_state["fa_start"],
+                            "key": cached_k, "value": cached_v,
+                        }))
+                if valid:
+                    valid = self._fa_reuse_supported(context, [name for name, _ in fa_payload])
             status.append(1 if valid else -1)
-            pending.append((index, rid, start, end, terminal, cross_step_state, writes))
+            pending.append((index, rid, start, end, terminal, cross_step_state, fa_payload))
         # 已推进状态丢失或 rank 不一致时必须报错，不能回退到历史源状态。
         self._validate_tp_cross_step_states(status)
-        for index, rid, start, end, terminal, cross_step_state, writes in pending:
-            for key, value, slot, cached_k, cached_v in writes:
-                key[slot].copy_(cached_k[0])
-                value[slot].copy_(cached_v[0])
-            # 预留的完整 FA block 也支持下一 step 只调度其中一小段。
+        for index, rid, start, end, terminal, cross_step_state, fa_payload in pending:
+            for name, span in fa_payload:
+                context.kvb_fa_reuse.setdefault(name, {}).setdefault(rid, []).append(span)
+            # 当前步只消费预留区间的交集，未消费部分仍由续接记录持有。
+            fa_end = min(span["start"] + span["key"].shape[0] for _, span in fa_payload)
             context.compute_masks[index][
-                : min(end, cross_step_state["fa_start"] + block_size) - start
+                : min(end, fa_end) - start
             ] = 1
             context.kvb_gdn_masks[index][: min(end, terminal) - start] = 1
             self._kvb_restored_cross_step_states[rid] = cross_step_state
@@ -1838,6 +1880,10 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
 
     def _prepare_reuse_masks_and_metadata(self, context, metadata, failed):
         """分别校验 FA 和 GDN 候选，发布复用 mask、分段数据及跨步记录。"""
+        if context is None:
+            return
+        context.kvb_fa_reuse = {}
+        self._kvb_fa_context = context
         inputs = getattr(context, "kvb_gdn_inputs", None)
         if inputs is None:
             return
@@ -1864,6 +1910,15 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
             for i, g in enumerate(self._kv_cache_config.kv_cache_groups)
             if _is_full_attention_group(g.kv_cache_spec)
         }
+        fa_names = [
+            name for gid in fa_ids
+            for name in self._kv_cache_config.kv_cache_groups[gid].layer_names
+        ]
+        fa_supported = all(name in self.kv_caches for name in fa_names)
+        fa_supported = fa_supported and self._fa_reuse_supported(context, fa_names)
+        if allow_reuse and not fa_supported:
+            logger.info("KVB FA reuse disabled: unsupported backend, metadata or cache dtype")
+        allow_reuse = allow_reuse and fa_supported
         state_ids = set(range(len(self._kv_cache_config.kv_cache_groups))) - fa_ids
         names = [
             name for name, values in specs.items() if isinstance(values[0], MambaSpec)
@@ -1891,23 +1946,33 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
                 if valid:
                     position = inputs["positions"][index]
                     count = len(context.compute_masks[index])
-                    # FA 只复用完整目标 blocks，最后一个 prompt block 保留计算 logits。
-                    last = min(
-                        last,
-                        (inputs["prompt_lengths"][index] - 1)
-                        // block_size
-                        * block_size,
-                    )
+                    last = min(last, inputs["prompt_lengths"][index] - 1)
                     valid = position <= first < last <= position + count
-                fa_candidates.append((index, first, last))
+                payload = {
+                    name: getattr(self, "kvb_fa_cache", {}).get((rid, job_index, name))
+                    for name in fa_names
+                }
+                valid = valid and all(
+                    span is not None and span["start"] == first
+                    and span["key"].shape[0] >= last - first
+                    and span["value"].shape == span["key"].shape
+                    for span in payload.values()
+                )
+                fa_candidates.append((rid, index, first, last, payload))
                 ready.append(bool(valid))
         if ready:
-            for accepted, (index, first, last) in zip(
+            for accepted, (rid, index, first, last, payload) in zip(
                 self._get_tp_agreed_reuse_flags(ready), fa_candidates
             ):
                 if accepted:
                     offset = first - inputs["positions"][index]
                     context.compute_masks[index][offset : offset + last - first] = 1
+                    for name, span in payload.items():
+                        context.kvb_fa_reuse.setdefault(name, {}).setdefault(rid, []).append({
+                            "start": first,
+                            "key": span["key"][:last - first],
+                            "value": span["value"][:last - first],
+                        })
 
         # 禁止新增复用时也必须消费已提交状态，保证状态与 token 位置一致。
         self._restore_cross_step_states(context, metadata, names, fa_ids, block_size)
@@ -1950,7 +2015,7 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
                         )
                     )
                 future = None
-                # 跨步只允许在目标 block 边界提前组合，且必须备齐下一 FA block。
+                # 保留现有 GDN 跨步协议，备齐超出本步的全部历史 K/V。
                 if valid and last > step_end:
                     future_chunks = getattr(request, "fa_lookahead_chunk_meta", ())
                     future_start_index = fa_count + len(
@@ -1969,16 +2034,17 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
                     valid = (
                         step_end % block_size == 0
                         and last - step_end < block_size
-                        and last
-                        <= (inputs["prompt_lengths"][index] - 1)
-                        // block_size
-                        * block_size
+                        and last <= inputs["prompt_lengths"][index] - 1
                         and future is not None
                         and set(future) == fa_names
+                        and all(
+                            k.ndim == 3 and k.shape[0] >= last - step_end
+                            and v.shape == k.shape for k, v in future.values()
+                        )
                         and any(
                             c.chunk_hash == chunk.chunk_hash
                             and c.destination_start + c.output_offset == step_end
-                            and c.output_length == block_size
+                            and c.output_length >= last - step_end
                             and {g.group_id for g in c.groups} == fa_ids
                             and (rid, future_start_index + i) not in failed
                             for i, c in enumerate(future_chunks)
@@ -2110,6 +2176,11 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
                 self.kvb_cross_step_states.pop(rid)
         self._kvb_restored_cross_step_states = {}
         getattr(self, "kvb_next_step_fa_cache", {}).clear()
+        getattr(self, "kvb_fa_cache", {}).clear()
+        context = getattr(self, "_kvb_fa_context", None)
+        if context is not None:
+            context.kvb_fa_reuse = {}
+        self._kvb_fa_context = None
         self.kvb_denoised_states.clear()
         self._kvb_processed_metadata = None
         super().clear_connector_metadata()
