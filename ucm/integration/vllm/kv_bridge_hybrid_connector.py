@@ -44,6 +44,35 @@ MAX_CLUSTER_NUM = 100000
 class RotaryEmbedding3D:
     """沿用原 KVB 的半维拆分 RoPE，对历史 K 做相对位置旋转。"""
 
+    @classmethod
+    def from_config(cls, config, head_dim, max_position, device="cpu"):
+        """读取实际文本 RoPE 参数；Qwen3.5 将参数保存在 rope_parameters。"""
+        parameters = getattr(config, "rope_parameters", None) or {}
+        if not isinstance(parameters, dict):
+            raise TypeError("KVB requires a single text rope_parameters dictionary")
+        scaling = getattr(config, "rope_scaling", None) or {}
+        if not isinstance(scaling, dict):
+            raise TypeError("KVB requires a rope_scaling dictionary")
+        rope_type = parameters.get(
+            "rope_type", scaling.get("rope_type", scaling.get("type", "default"))
+        )
+        if rope_type not in ("default", "mrope"):
+            raise ValueError(
+                f"KVB relative text RoPE does not support rope_type={rope_type!r}"
+            )
+        factor = parameters.get(
+            "partial_rotary_factor", getattr(config, "partial_rotary_factor", 1.0)
+        )
+        if not 0 < factor <= 1:
+            raise ValueError("KVB partial_rotary_factor must be in (0, 1]")
+        return cls(
+            head_dim=int(head_dim * factor),
+            max_position=getattr(config, "max_position_embeddings", max_position),
+            base=parameters.get("rope_theta", getattr(config, "rope_theta", 1000000.0)),
+            device=device,
+            dtype=torch.float32,
+        )
+
     def __init__(
         self,
         head_dim: int,
@@ -245,9 +274,9 @@ class KVCacheLayoutKVB:
     """沿用存储注册的字节布局，为 chunk 加载提供临时缓冲区。"""
 
     def __init__(self, layout, kvcaches):
-        """按注册布局分配 1200 个临时 block，并使用缓存所在设备。"""
+        """按注册布局分配 200 个临时 block，并使用缓存所在设备。"""
         self.layout = layout
-        self.load_num_blocks = 1200
+        self.load_num_blocks = 200
         self.num_blocks = self.load_num_blocks
         self.device = None
         for cache in kvcaches.values():
@@ -342,9 +371,6 @@ class KVClusterMap:
         # 容量已满时淘汰最早插入的 cluster，同时清理倒排索引。
         if len(self.candidates) >= self.capacity:
             key, old = self.candidates.popitem(last=False)
-            logger.info(
-                "KVB index evict request=%s cluster=%s", old.request_id, key.hex()
-            )
             for chunk in set(old.kvcluster_info.chunk_hash_ids):
                 self.inverted[chunk].pop(key, None)
                 if not self.inverted[chunk]:
@@ -352,11 +378,6 @@ class KVClusterMap:
         self.candidates[cluster.cluster_id] = cluster
         for chunk in set(cluster.kvcluster_info.chunk_hash_ids):
             self.inverted[chunk][cluster.cluster_id] = None
-        logger.info(
-            "KVB index register request=%s cluster=%s chunks=%s history_clusters=%s",
-            cluster.request_id, cluster.cluster_id.hex(),
-            cluster.kvcluster_info.chunk_num, len(self.candidates),
-        )
 
     def search_top_one(self, chunks, lengths, exclude_request_id=""):
         """按去重后的匹配 token 总数选一个历史 cluster，排除当前请求。"""
@@ -710,11 +731,6 @@ class KVBHybridGroupManager:
         self.block_size = mamba_block_size
         self.lcm_block_size = self.block_size
 
-        logger.info(
-            "KVBHybridGroupManager initialized: mamba_block_size=%s, block_size=%s",
-            mamba_block_size,
-            attention_block_size,
-        )
 
     @property
     def num_groups(self) -> int:
@@ -874,7 +890,6 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
             self.block_size = self.group_manager.block_size
             self.hash_block_size = self.group_manager.block_size
 
-        logger.info("%s initialized for mamba_cache_mode=all", type(self).__name__)
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """注册正常缓存，并建立 chunk 临时布局和 FP32 RoPE 修正缓存。"""
@@ -882,7 +897,6 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
         # its original kernel-block views of the same storage.
         normalized = dict(kv_caches)
         spec_map = layer_name_to_kv_cache_spec(self._kv_cache_config)
-        fa_count = state_count = 0
         for name, cache in kv_caches.items():
             spec = spec_map[name][0]
             if isinstance(spec, FullAttentionSpec) and not isinstance(
@@ -891,15 +905,6 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
                 normalized[name] = get_attention_kv_views(
                     cache, spec, self._kv_cache_config.num_blocks
                 )
-                if fa_count == 0:
-                    original = cache if isinstance(cache, (tuple, list)) else (cache,)
-                    logger.info(
-                        "KVB FA cache view layer=%s original_shapes=%s logical_shapes=%s",
-                        name,
-                        [tuple(t.shape) for t in original],
-                        [tuple(t.shape) for t in normalized[name]],
-                    )
-                fa_count += 1
             elif isinstance(spec, MambaSpec) and self.chunk_end_token_ids:
                 try:
                     normalized[name] = get_mamba_state_views(
@@ -909,26 +914,15 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
                     raise ValueError(
                         f"Cannot register KVB Mamba layer {name}: {exc}"
                     ) from exc
-                state_count += 1
         super().register_kv_caches(normalized)
-        logger.info(
-            "KVB registered logical cache views: FA layers=%s, Mamba layers with g=%s",
-            fa_count,
-            state_count,
-        )
         self.kv_cache_layout_kvb = KVCacheLayoutKVB(
             self.kv_cache_layout, self.kv_caches
         )
-        self.rotary_emb_3d = RotaryEmbedding3D(
+        self.rotary_emb_3d = RotaryEmbedding3D.from_config(
+            config=self.hf_text_config,
             head_dim=self.vllm_config.model_config.get_head_size(),
-            max_position=getattr(
-                self.hf_text_config,
-                "max_position_embeddings",
-                self.max_model_len,
-            ),
-            base=getattr(self.hf_text_config, "rope_theta", 1000000.0),
+            max_position=self.max_model_len,
             device=self.kv_cache_layout_kvb.device,
-            dtype=torch.float32,
         )
 
     def compute_block_hashes(
@@ -944,13 +938,6 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
     def _process_req(self, all_token_ids, group_block_ids, prefix_len, request_id=""):
         """从前缀命中终点扫描已结束 chunk，建索引并选最佳历史 cluster。"""
         info = KVClusterInfo()
-        logger.info(
-            "KVB scan request=%s total_tokens=%s prefix_len=%s end_token_ids=%s "
-            "min_chunk_len=%s history_clusters=%s",
-            request_id, len(all_token_ids), prefix_len,
-            sorted(self.chunk_end_token_ids), MIN_CHUNK_LEN,
-            len(self.kv_cluster_map.candidates),
-        )
         # 已命中的 prefix 不再参与内容 chunk 匹配。
         start = prefix_len
         for end in range(prefix_len, len(all_token_ids)):
@@ -967,22 +954,9 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
                     or start // g.block_size >= len(group_block_ids[g.group_id])
                 ]
                 if missing_groups:
-                    logger.info(
-                        "KVB chunk skip request=%s start=%s end=%s tokens=%s "
-                        "reason=missing_start_block_hash groups=%s block_hash_counts=%s",
-                        request_id, start, end + 1, end + 1 - start,
-                        missing_groups, [len(ids) for ids in group_block_ids],
-                    )
                     start = end + 1
                     continue
                 key = self.generate_chunk_hash(all_token_ids[start : end + 1])
-                logger.info(
-                    "KVB chunk request=%s start=%s end=%s tokens=%s hash=%s "
-                    "duplicate=%s history_matches=%s",
-                    request_id, start, end + 1, end + 1 - start, key.hex(),
-                    key in info.chunk_lens,
-                    len(self.kv_cluster_map.inverted.get(key, ())),
-                )
                 info.chunk_hash_ids.append(key)
                 # 同一 chunk hash 多次出现时，沿用原 KVB 的最后位置记录规则。
                 info.chunk_start_positions[key] = start
@@ -998,37 +972,12 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
                     else None
                     for g in self.group_manager.groups_by_id
                 ]
-            else:
-                logger.info(
-                    "KVB chunk skip request=%s start=%s end=%s tokens=%s "
-                    "reason=short_chunk",
-                    request_id, start, end + 1, end + 1 - start,
-                )
             start = end + 1
-        if start < len(all_token_ids):
-            logger.info(
-                "KVB chunk skip request=%s start=%s end=%s tokens=%s "
-                "reason=unterminated_tail",
-                request_id, start, len(all_token_ids), len(all_token_ids) - start,
-            )
         if not info.chunk_hash_ids:
-            logger.info("KVB lookup miss request=%s reason=no_eligible_chunks", request_id)
             return None, None
         best_id = self.kv_cluster_map.search_top_one(
             info.chunk_hash_ids, info.chunk_lens, request_id
         )
-        if best_id is None:
-            logger.info(
-                "KVB lookup miss request=%s chunks=%s reason=no_history_candidate",
-                request_id, info.chunk_num,
-            )
-        else:
-            logger.info(
-                "KVB candidate request=%s history_request=%s cluster=%s "
-                "selection=single_best",
-                request_id, self.kv_cluster_map.candidates[best_id].request_id,
-                best_id.hex(),
-            )
         return info, best_id
 
     def get_kvbridge_matched_tokens(self, request, group_block_ids, prefix_hit_len):
@@ -1053,11 +1002,6 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
         )
         meta = self.requests_meta.get(request.request_id)
         if meta is None:
-            logger.info(
-                "KVB lookup skip request=%s computed_tokens=%s prefix_matched=%s "
-                "reason=no_request_metadata",
-                request.request_id, num_computed_tokens, matched,
-            )
             return matched, async_load
         meta = KVBRequestMeta(
             **{
@@ -1068,10 +1012,6 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
         # 用扩展对象替换 HLA metadata，保留前缀命中和各组 block 信息。
         self.requests_meta[request.request_id] = meta
         if not self.chunk_end_token_ids:
-            logger.info(
-                "KVB lookup skip request=%s reason=no_chunk_end_token_id",
-                request.request_id,
-            )
             return matched, async_load
         (meta.new_kv_cluster, meta.load_chunk_meta, meta.mamba_load_chunk_meta) = (
             self.get_kvbridge_matched_tokens(
@@ -1080,28 +1020,9 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
                 num_computed_tokens + matched,
             )
         )
-        if meta.load_chunk_meta or meta.mamba_load_chunk_meta:
-            fa_tokens = sum(chunk.length for chunk in meta.load_chunk_meta)
-            mamba_tokens = sum(chunk.length for chunk in meta.mamba_load_chunk_meta)
-            # 按复用范围计数，不重复累加缓存组，也不包含前置 checkpoint。
+        if not meta.load_chunk_meta and not meta.mamba_load_chunk_meta:
             logger.info(
-                "KVB lookup hit request=%s block_size=%s "
-                "fa_chunks=%s fa_blocks=%s fa_tokens=%s "
-                "mamba_chunks=%s mamba_blocks=%s mamba_tokens=%s "
-                "(reuse candidates; pending load/forward validation)",
-                request.request_id,
-                self.block_size,
-                len(meta.load_chunk_meta),
-                fa_tokens // self.block_size,
-                fa_tokens,
-                len(meta.mamba_load_chunk_meta),
-                mamba_tokens // self.block_size,
-                mamba_tokens,
-            )
-        else:
-            logger.info(
-                "KVB lookup result request=%s fa_blocks=0 mamba_blocks=0",
-                request.request_id,
+                "KVB REUSE request=%s fa_blocks=0 mamba_blocks=0", request.request_id
             )
         # chunk 命中仅生成候选，不增加 scheduler 认为已计算的 token 数。
         return matched, async_load
@@ -1145,11 +1066,6 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
                 ids = hashes[skip : skip + count]
                 previous = group.is_mamba_all and first > 0
                 if not ids:
-                    logger.info(
-                        "KVB range reject request=%s hash=%s group=%s "
-                        "reason=no_source_block_hashes src=%s tokens=%s",
-                        new_cluster.request_id, key.hex(), group.group_id, src, length,
-                    )
                     return 0, ()
                 if previous:
                     # 非零起点的 GDN 需要前一个 checkpoint 来扣除旧入口状态贡献。
@@ -1159,42 +1075,16 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
                         else old.chunk_previous_block_ids[key][group.group_id]
                     )
                     if preceding is None:
-                        logger.info(
-                            "KVB range reject request=%s hash=%s group=%s "
-                            "reason=missing_previous_checkpoint",
-                            new_cluster.request_id, key.hex(), group.group_id,
-                        )
                         return 0, ()
                     ids = [preceding] + ids
                 # lookup 返回连续命中的最后下标，-1 表示未命中，+1 转为块数。
                 lookup_result = lookup(list(ids))
                 hits = max(0, min(len(ids), lookup_result + 1))
-                logger.info(
-                    "KVB lookup keys request=%s history_request=%s kind=%s group=%s "
-                    "keys=%s lookup_result=%s",
-                    new_cluster.request_id, best_cluster.request_id,
-                    "mamba" if group.is_mamba_all else "fa", group.group_id,
-                    [key.hex() for key in ids], lookup_result,
-                )
                 # 前置 checkpoint 和源 block 内偏移不计入可复用 token 数。
                 available = max(0, (hits - int(previous)) * bs - offset)
-                requested_length = length
                 # 每组检查后收缩长度，最终所有组都覆盖同一完整 block 范围。
                 length = min(length, available) // self.block_size * self.block_size
-                logger.info(
-                    "KVB store lookup request=%s hash=%s kind=%s group=%s "
-                    "block_size=%s src=%s source_offset=%s previous_checkpoint=%s "
-                    "queried_blocks=%s hit_blocks=%s requested_tokens=%s reusable_tokens=%s",
-                    new_cluster.request_id, key.hex(),
-                    "mamba" if group.is_mamba_all else "fa", group.group_id,
-                    bs, src, offset, previous, len(ids), hits, requested_length, length,
-                )
                 if length <= 0:
-                    logger.info(
-                        "KVB range reject request=%s hash=%s group=%s "
-                        "reason=insufficient_cached_blocks",
-                        new_cluster.request_id, key.hex(), group.group_id,
-                    )
                     return 0, ()
                 verified.append(
                     GroupChunk(group.group_id, bs, tuple(ids[:hits]), offset, previous)
@@ -1218,11 +1108,6 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
         # 相同 chunk hash 只检查一次，位置沿用索引中记录的最后一次出现。
         for key in dict.fromkeys(current.chunk_hash_ids):
             if key not in old.chunk_lens:
-                logger.info(
-                    "KVB chunk skip request=%s hash=%s history_request=%s "
-                    "reason=not_in_selected_cluster",
-                    new_cluster.request_id, key.hex(), best_cluster.request_id,
-                )
                 continue
             dst = current.chunk_start_positions[key]
             src = old.chunk_start_positions[key]
@@ -1232,20 +1117,7 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
             length = min(current.chunk_lens[key], old.chunk_lens[key]) - lead
             # 不再先裁目标整块，否则会丢掉可用的源 checkpoint。
             length = length // self.block_size * self.block_size
-            logger.info(
-                "KVB align request=%s hash=%s kind=fa original_src=%s "
-                "original_dst=%s chunk_tokens=%s lead=%s src=%s dst=%s "
-                "aligned_tokens=%s blocks=%s",
-                new_cluster.request_id, key.hex(), old.chunk_start_positions[key],
-                current.chunk_start_positions[key], current.chunk_lens[key],
-                lead, src, dst, length, length // self.block_size,
-            )
             if length <= 0:
-                logger.info(
-                    "KVB range reject request=%s hash=%s kind=fa "
-                    "reason=no_complete_source_block",
-                    new_cluster.request_id, key.hex(),
-                )
                 continue
             # K/V 加载范围和 GDN 跳过范围分别检查，缺失状态不能发布跳过。
             length, groups = verify_range(key, src, length, fa_groups)
@@ -1255,18 +1127,7 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
             # GDN 只取 FA 成功范围内的完整源 blocks，目标位置可以带块内偏移。
             first = (src + self.block_size - 1) // self.block_size * self.block_size
             last = (src + length) // self.block_size * self.block_size
-            logger.info(
-                "KVB align request=%s hash=%s kind=mamba src=%s dst=%s "
-                "aligned_tokens=%s blocks=%s",
-                new_cluster.request_id, key.hex(), first, dst + first - src,
-                max(0, last - first), max(0, last - first) // self.block_size,
-            )
             if first >= last:
-                logger.info(
-                    "KVB range reject request=%s hash=%s kind=mamba "
-                    "reason=no_complete_source_block",
-                    new_cluster.request_id, key.hex(),
-                )
                 continue
             # Mamba 缓存缺失只关闭 GDN 复用，已确认的 FA 命中仍保留。
             mamba_length, groups = verify_range(key, first, last - first, state_groups)
@@ -1326,13 +1187,6 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
             )
 
         # 物理 block 0 是有效缓存地址，不能在追加时过滤。
-        logger.info(
-            "KVB dispatch keys request=%s group=%s operation=%s "
-            "blocks(logical,key,physical)=%s",
-            request_id, group_id, reason,
-            [(start_block + i, key.hex(), slot)
-             for i, (key, slot) in enumerate(zip(ucm_slice, vllm_slice))],
-        )
         dst_ucm_ids.extend(ucm_slice)
         dst_vllm_ids.extend(vllm_slice)
 
@@ -1916,8 +1770,6 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
         ]
         fa_supported = all(name in self.kv_caches for name in fa_names)
         fa_supported = fa_supported and self._fa_reuse_supported(context, fa_names)
-        if allow_reuse and not fa_supported:
-            logger.info("KVB FA reuse disabled: unsupported backend, metadata or cache dtype")
         allow_reuse = allow_reuse and fa_supported
         state_ids = set(range(len(self._kv_cache_config.kv_cache_groups))) - fa_ids
         names = [
@@ -1928,6 +1780,14 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
             for g in self._kv_cache_config.kv_cache_groups
             if _is_mamba_all_group(g.kv_cache_spec)
         )
+        context.kvb_reuse_block_size = block_size
+        context.kvb_reuse_log_rank = getattr(self, "tp_rank", 0) % getattr(self, "tp_size", 1)
+        context.kvb_reuse_request_ids = {
+            rid for rid, request in metadata.request_meta.items()
+            if getattr(request, "load_chunk_meta", ())
+            or getattr(request, "mamba_load_chunk_meta", ())
+            or rid in self.kvb_cross_step_states
+        }
         fa_candidates, ready = [], []
         for rid, request in sorted(metadata.request_meta.items()):
             for job_index, chunk in enumerate(getattr(request, "load_chunk_meta", ())):
@@ -2156,11 +2016,6 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
                 context.kvb_gdn_meta.setdefault(name, {}).setdefault(rid, []).append(
                     span
                 )
-        reused = sum(int(mask.sum()) for mask in context.kvb_gdn_masks.values())
-        if reused:
-            logger.info(
-                "KVB GDN reuse plan tokens=%s (source-block aligned; pending layer execution)", reused
-            )
 
     def clear_connector_metadata(self):
         # 后处理算子可能仍引用临时视图，等待设备执行完成后再清理。
