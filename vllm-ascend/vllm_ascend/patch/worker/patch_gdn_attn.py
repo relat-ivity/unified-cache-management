@@ -14,9 +14,11 @@
 # limitations under the License.
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import torch
 import vllm.v1.attention.backends.gdn_attn as gdn_attn
+from vllm.config import CUDAGraphMode
 from vllm.logger import logger
 
 from vllm_ascend.ops.triton.gdn_chunk_meta import (
@@ -24,8 +26,8 @@ from vllm_ascend.ops.triton.gdn_chunk_meta import (
     _validate_cu_seqlens,
     build_chunk_meta_device,
 )
-from vllm_ascend.patch.platform.patch_mamba_config import (     
-    _qwen35_g_cache_enabled, 
+from vllm_ascend.patch.platform.patch_mamba_config import (
+    _qwen35_g_cache_enabled,
 )
 from vllm_ascend.utils import is_310p
 
@@ -535,6 +537,47 @@ def _build_non_spec_chunked_prefill_meta_cpu(builder, cu_seqlens_cpu: torch.Tens
     return _build_chunked_prefill_metadata(builder, tensors)
 
 
+def build_gdn_segment_chunk_meta(length: int, num_heads: int, device: torch.device) -> GDNChunkedPrefillMetadata:
+    """Build a single-sequence segment's indices without reading device lengths.
+
+    The segment length and local value-head count are already known on the host.
+    Pack all six metadata tensors into one transfer; returned views are read-only
+    and can be reused by equal-length segments across GDN layers in this forward.
+    """
+    if length <= 0 or num_heads <= 0:
+        raise ValueError("GDN segment length and local head count must be positive")
+    builder = SimpleNamespace(
+        _ascend_gdn_chunk_size=_GDN_CHUNK_SIZE,
+        _ascend_gdn_large_block_size=_GDN_SOLVE_TRIL_LARGE_BLOCK_SIZE,
+        _ascend_gdn_cumsum_block_size=_next_power_of_2(
+            max(1, _GDN_CUMSUM_WORKING_SET // (num_heads * _GDN_CHUNK_SIZE))
+        ),
+    )
+    host = _build_non_spec_chunked_prefill_meta_cpu(
+        builder, torch.tensor([0, length], dtype=torch.int32, device="cpu")
+    )
+    tensors = {
+        name: getattr(host, name)
+        for name in (
+            "chunk_indices_chunk64",
+            "chunk_offsets_chunk64",
+            "update_chunk_offsets_chunk64",
+            "final_chunk_indices_chunk64",
+            "chunk_indices_large_block",
+            "block_indices_cumsum",
+        )
+    }
+    packed_host = torch.cat([tensor.reshape(-1) for tensor in tensors.values()])
+    packed_device = packed_host.to(device=device, non_blocking=True)
+    views = {}
+    offset = 0
+    for name, tensor in tensors.items():
+        views[name] = packed_device[offset : offset + tensor.numel()].view(tensor.shape)
+        offset += tensor.numel()
+    # Keep the host allocation alive until the forward's asynchronous copy ends.
+    return GDNChunkedPrefillMetadata(**views, _buffer_slot=packed_host)
+
+
 def _build_non_spec_chunked_prefill_meta(
     builder,
     cu_seqlens_cpu: torch.Tensor,
@@ -704,7 +747,9 @@ def _compute_all_mode_metadata(builder, attn_metadata, m):
             # without replacing the native CausalConv1d with the APC Triton
             # convolution kernel.
             prefill_query_starts = m.query_start_loc[num_decodes:num_seqs].to(torch.long)
-            conv_scatter_end_indices = prefill_query_starts.index_select(0, scatter_seq_ids) + (local_offsets + 1) * block_size            
+            conv_scatter_end_indices = (
+                prefill_query_starts.index_select(0, scatter_seq_ids) + (local_offsets + 1) * block_size
+            )
             scatter_src_indices = (
                 prefill_chunk_offsets[:-1].index_select(0, scatter_seq_ids)
                 + prefill_chunk_start
@@ -746,6 +791,64 @@ def _warn_all_mode_spec_fallback_once() -> None:
     _FALLBACK_ALL_MODE_SPEC_WARNED = True
 
 
+def _can_skip_decode_state_copy(builder, attn_metadata, common_attn_metadata) -> bool:
+    """Prove equal SOURCE/DEST blocks using existing, corrected CPU metadata.
+
+    Host decisions are safe in eager, or piecewise mode with GDN explicitly
+    split out of the captured graphs. Full graphs, missing CPU mirrors,
+    one-token prefills and speculative batches retain the old path.
+    """
+    config = builder.vllm_config
+    if config.speculative_config is not None:
+        return False
+    if not getattr(config.model_config, "enforce_eager", False):
+        compilation = getattr(config, "compilation_config", None)
+        if (
+            compilation is None
+            or compilation.cudagraph_mode != CUDAGraphMode.PIECEWISE
+            or "vllm::gdn_attention_core" not in (compilation.splitting_ops or ())
+        ):
+            return False
+    count = attn_metadata.num_decodes
+    if (
+        count <= 0
+        or attn_metadata.num_prefills != 0
+        or attn_metadata.spec_state_indices_tensor is not None
+        or common_attn_metadata.num_reqs != count
+    ):
+        return False
+
+    # The runner completes correction of this CPU mirror before metadata build.
+    # Do not use a lazy property or copy a device tensor back to the host here.
+    seq_lens_cpu = getattr(common_attn_metadata, "_seq_lens_cpu", None)
+    if seq_lens_cpu is None:
+        seq_lens_cpu = getattr(common_attn_metadata, "seq_lens_cpu", None)
+    query_start_cpu = getattr(common_attn_metadata, "query_start_loc_cpu", None)
+    is_prefilling = getattr(common_attn_metadata, "is_prefilling", None)
+    for tensor, size in ((seq_lens_cpu, count), (query_start_cpu, count + 1), (is_prefilling, count)):
+        if not isinstance(tensor, torch.Tensor) or tensor.device.type != "cpu" or tensor.ndim != 1:
+            return False
+        if tensor.numel() < size:
+            return False
+    if seq_lens_cpu.dtype not in (torch.int32, torch.int64) or query_start_cpu.dtype not in (
+        torch.int32,
+        torch.int64,
+    ):
+        return False
+
+    seq_lens = seq_lens_cpu[:count].tolist()
+    starts = query_start_cpu[: count + 1].tolist()
+    prefilling = is_prefilling[:count].tolist()
+    block_size = builder.kv_cache_spec.block_size
+    return starts[0] == 0 and all(
+        not prefill
+        and end - begin == 1
+        and seq_len > 1
+        and (seq_len - 2) // block_size == (seq_len - 1) // block_size
+        for seq_len, begin, end, prefill in zip(seq_lens, starts, starts[1:], prefilling)
+    )
+
+
 def _patched_build(
     self,
     common_prefix_len: int,
@@ -783,6 +886,7 @@ def _patched_build(
     attn_metadata = _build_with_cache_mode()
     attn_metadata.non_spec_prefill_fallback_meta = None
     attn_metadata.is_all_mode = False
+    attn_metadata.skip_state_copy = False
 
     mamba_cache_mode = cache_config.mamba_cache_mode
     if mamba_cache_mode == "all":
@@ -791,8 +895,10 @@ def _patched_build(
             attn_metadata = _build_with_cache_mode("align")
             attn_metadata.non_spec_prefill_fallback_meta = None
             attn_metadata.is_all_mode = False
+            attn_metadata.skip_state_copy = False
         else:
             _compute_all_mode_metadata(self, attn_metadata, common_attn_metadata)
+            attn_metadata.skip_state_copy = _can_skip_decode_state_copy(self, attn_metadata, common_attn_metadata)
 
     if save_g_to_kv_cache:
         attn_metadata._ascend_g_prefill_token_indices = (
