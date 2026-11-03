@@ -1058,6 +1058,12 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
         if candidates:
             first_reuse = min(chunk.destination_start for chunk in candidates)
             limit = first_reuse // self.block_size * self.block_size
+            if current_platform.device_type == "npu" and len(meta.mamba_load_chunk_meta) == 1:
+                hit = meta.mamba_load_chunk_meta[0]
+                prefix_end = num_computed_tokens + matched
+                if prefix_end < hit.destination_start and hit.destination_start + hit.length < request.num_prompt_tokens:
+                    # Leave the two miss spans free of publishable checkpoints.
+                    limit = min(limit, prefix_end // self.block_size * self.block_size)
             meta.cache_write_limit = limit_kvb_cache_writes(request, limit)
         elif meta.cache_write_limit is not None:
             meta.cache_write_limit = limit_kvb_cache_writes(request, num_computed_tokens + matched)
@@ -1895,8 +1901,14 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
         self._restore_cross_step_states(context, metadata, names, fa_ids, block_size)
 
         tables = {}
+        host_metadata = getattr(context, "kvb_gdn_host_metadata", None) or {}
         for name in names:
-            table = getattr(context.attn_metadata.get(name), "block_table_2d", None)
+            layer_metadata = context.attn_metadata.get(name)
+            host = host_metadata.get(id(layer_metadata))
+            if host is not None:
+                tables[name] = host[0]
+                continue
+            table = getattr(layer_metadata, "block_table_2d", None)
             if table is not None:
                 tables[name] = table.detach().cpu().tolist()
         candidates, ready = [], []
