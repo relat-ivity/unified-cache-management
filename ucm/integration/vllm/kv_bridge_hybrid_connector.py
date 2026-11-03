@@ -2,6 +2,7 @@ import math
 from collections import OrderedDict, defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
+from functools import wraps
 from typing import ClassVar
 
 import numpy as np
@@ -39,6 +40,34 @@ logger = init_logger(__name__)
 
 MIN_CHUNK_LEN = 512
 MAX_CLUSTER_NUM = 100000
+
+
+def limit_kvb_cache_writes(request, prefix_tokens):
+    """Keep the safe prefix limit across retries and preemption."""
+    previous = getattr(request, "_ucm_kvb_cache_write_limit", None)
+    limit = prefix_tokens if previous is None else min(previous, prefix_tokens)
+    request._ucm_kvb_cache_write_limit = limit
+    return limit
+
+
+def install_kvb_cache_write_policy():
+    """Limit PC registration in every cache group while retaining live blocks."""
+    # Scheduler-only import; workers do not need vLLM core here.
+    from vllm.v1.core.single_type_kv_cache_manager import SingleTypeKVCacheManager
+
+    original = SingleTypeKVCacheManager.cache_blocks
+    if getattr(original, "_ucm_kvb_cache_write_policy", False):
+        return
+
+    @wraps(original)
+    def cache_blocks(self, request, num_tokens):
+        limit = getattr(request, "_ucm_kvb_cache_write_limit", None)
+        if limit is not None:
+            num_tokens = min(num_tokens, limit)
+        return original(self, request, num_tokens)
+
+    cache_blocks._ucm_kvb_cache_write_policy = True
+    SingleTypeKVCacheManager.cache_blocks = cache_blocks
 
 
 class RotaryEmbedding3D:
@@ -439,6 +468,7 @@ class KVBRequestMeta(HLARequestMeta):
     # 两者按完整源 checkpoint block 选取，目标位置允许块内偏移。
     load_chunk_meta: list[LoadChunkMeta] = field(default_factory=list)
     mamba_load_chunk_meta: list[LoadChunkMeta] = field(default_factory=list)
+    cache_write_limit: int | None = None
 
 
 @dataclass
@@ -449,6 +479,8 @@ class KVBRequestDispatchMeta(RequestDispatchMeta):
     group_vllm_block_ids: list[list[int]] = field(default_factory=list)
     fa_lookahead_chunk_meta: list[LoadChunkMeta] = field(default_factory=list)
     reset_kvb_state: bool = False
+    cache_write_limit: int | None = None
+    private_prefill: bool = False
 
 
 def build_step_chunk_metadata(chunks, start, end, alignment, *, source_aligned=False):
@@ -883,6 +915,7 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
         self._kvb_processed_metadata = None
 
         if role == KVConnectorRole.SCHEDULER:
+            install_kvb_cache_write_policy()
             self.group_manager = KVBHybridGroupManager(
                 kv_cache_config=kv_cache_config,
                 connector=self,
@@ -1011,6 +1044,7 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
         )
         # 用扩展对象替换 HLA metadata，保留前缀命中和各组 block 信息。
         self.requests_meta[request.request_id] = meta
+        meta.cache_write_limit = getattr(request, "_ucm_kvb_cache_write_limit", None)
         if not self.chunk_end_token_ids:
             return matched, async_load
         (meta.new_kv_cluster, meta.load_chunk_meta, meta.mamba_load_chunk_meta) = (
@@ -1020,6 +1054,13 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
                 num_computed_tokens + matched,
             )
         )
+        candidates = meta.load_chunk_meta + meta.mamba_load_chunk_meta
+        if candidates:
+            first_reuse = min(chunk.destination_start for chunk in candidates)
+            limit = first_reuse // self.block_size * self.block_size
+            meta.cache_write_limit = limit_kvb_cache_writes(request, limit)
+        elif meta.cache_write_limit is not None:
+            meta.cache_write_limit = limit_kvb_cache_writes(request, num_computed_tokens + matched)
         if not meta.load_chunk_meta and not meta.mamba_load_chunk_meta:
             logger.info(
                 "KVB REUSE request=%s fa_blocks=0 mamba_blocks=0", request.request_id
@@ -1151,7 +1192,7 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
         for request_id, outputs in entries:
             meta = self.requests_meta.get(request_id)
             # 请求首次产生输出后才登记 cluster，重复登记由索引去重。
-            if outputs > 0 and isinstance(meta, KVBRequestMeta):
+            if outputs > 0 and isinstance(meta, KVBRequestMeta) and meta.cache_write_limit is None:
                 self.kv_cluster_map.insert_cluster(meta.new_kv_cluster)
         return super().build_connector_meta(scheduler_output)
 
@@ -1269,6 +1310,8 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
                 req_meta.token_processed + new_tokens,
                 req_meta.num_token_ids,
             )
+            if req_meta.cache_write_limit is not None:
+                dump_end = min(dump_end, req_meta.cache_write_limit)
 
             for group in manager.full_attn_groups:
                 self._append_block_range(
@@ -1339,6 +1382,11 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
             group_vllm_block_ids=[list(ids) for ids in req_meta.group_vllm_block_ids],
             fa_lookahead_chunk_meta=future_fa,
             reset_kvb_state=incoming_block_ids_are_full,
+            cache_write_limit=req_meta.cache_write_limit,
+            private_prefill=(
+                req_meta.cache_write_limit is not None
+                and step_end > max(step_start, req_meta.cache_write_limit)
+            ),
         )
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
@@ -1738,6 +1786,7 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
             return
         context.kvb_fa_reuse = {}
         self._kvb_fa_context = context
+        context.kvb_gdn_cache_write_limits = {}
         inputs = getattr(context, "kvb_gdn_inputs", None)
         if inputs is None:
             return
@@ -1758,6 +1807,14 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
             i: np.zeros_like(mask) for i, mask in context.compute_masks.items()
         }
         indices = {rid: i for i, rid in enumerate(inputs["request_ids"])}
+        # A step that reaches the private suffix needs its exact boundary, even
+        # when its first tokens are still part of the publishable prefix.
+        context.kvb_gdn_cache_write_limits = {
+            rid: limit for rid, request in metadata.request_meta.items()
+            if (index := indices.get(rid)) is not None
+            and (limit := getattr(request, "cache_write_limit", None)) is not None
+            and inputs["positions"][index] + len(context.kvb_gdn_masks[index]) > limit
+        }
         specs = layer_name_to_kv_cache_spec(self._kv_cache_config)
         fa_ids = {
             i
