@@ -4,6 +4,7 @@ from collections import OrderedDict, defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from functools import wraps
+from inspect import signature
 from typing import ClassVar
 from uuid import uuid4
 
@@ -45,6 +46,7 @@ MIN_CHUNK_LEN = 512
 MAX_CLUSTER_NUM = 100000
 END_PREFIX_FORMAT = b"UCM_KVB_END_PREFIX_V1"
 END_PREFIX_COMMIT = struct.Struct(f"!{len(END_PREFIX_FORMAT)}sQ16s")
+END_PREFIX_LOAD_ADMISSION = 1
 
 
 @dataclass(frozen=True)
@@ -72,20 +74,79 @@ def install_end_prefix_recovery():
     from vllm.v1.core.sched.scheduler import Scheduler
 
     original = Scheduler._update_waiting_for_remote_kv
-    if getattr(original, "_ucm_end_prefix_recovery", False):
+    if not getattr(original, "_ucm_end_prefix_recovery", False):
+        @wraps(original)
+        def update_waiting(self, request):
+            if getattr(request, "_ucm_end_prefix_load_failed", False):
+                request.num_computed_tokens = 0
+                request.num_external_computed_tokens = 0
+                self.failed_recving_kv_req_ids.add(request.request_id)
+                request._ucm_end_prefix_load_failed = False
+            return original(self, request)
+
+        update_waiting._ucm_end_prefix_recovery = True
+        Scheduler._update_waiting_for_remote_kv = update_waiting
+
+    original_split = getattr(Scheduler, "_mamba_block_aligned_split", None)
+    if original_split is None or getattr(original_split, "_ucm_end_prefix_split", False):
         return
 
-    @wraps(original)
-    def update_waiting(self, request):
-        if getattr(request, "_ucm_end_prefix_load_failed", False):
-            request.num_computed_tokens = 0
-            request.num_external_computed_tokens = 0
-            self.failed_recving_kv_req_ids.add(request.request_id)
-            request._ucm_end_prefix_load_failed = False
-        return original(self, request)
+    @wraps(original_split)
+    def split(self, request, num_new_tokens, *args, **kwargs):
+        if getattr(request, "_ucm_end_prefix_pending", None) is not None and num_new_tokens == 0:
+            # The scheduler rejects a zero result before admitting async loads.
+            # The private allocator restores zero compute tokens; the scheduler
+            # then queues WAITING_FOR_REMOTE_KVS without scheduling a forward.
+            return END_PREFIX_LOAD_ADMISSION
+        if getattr(request, "_ucm_end_prefix_resumed", False):
+            return num_new_tokens
+        return original_split(self, request, num_new_tokens, *args, **kwargs)
 
-    update_waiting._ucm_end_prefix_recovery = True
-    Scheduler._update_waiting_for_remote_kv = update_waiting
+    split._ucm_end_prefix_split = True
+    Scheduler._mamba_block_aligned_split = split
+
+
+def make_end_prefix_private_allocation(original):
+    """A complete snapshot owns its FA pages, including any local PC prefix."""
+    call_signature = signature(original)
+
+    @wraps(original)
+    def allocate(self, request, *args, **kwargs):
+        point = getattr(request, "_ucm_end_prefix_pending", None)
+        if point is None:
+            return original(self, request, *args, **kwargs)
+        call = call_signature.bind(self, request, *args, **kwargs)
+        call.arguments.update(
+            num_new_computed_tokens=0,
+            new_computed_blocks=self.empty_kv_cache_blocks,
+            num_external_computed_tokens=point.tokens,
+        )
+        if "delay_cache_blocks" in call_signature.parameters:
+            call.arguments["delay_cache_blocks"] = True
+            call.arguments["num_new_tokens"] = 0
+        result = original(*call.args, **call.kwargs)
+        if result is None or result is False:
+            request._ucm_end_prefix_pending = None
+            request._ucm_end_prefix_rejected_key = point.key
+            logger.info(
+                "KVB END fallback request=%s reason=private_page_capacity",
+                request.request_id,
+            )
+        return result
+
+    allocate._ucm_end_prefix_private_allocation = True
+    return allocate
+
+
+def install_end_prefix_private_allocation():
+    from vllm.v1.core.kv_cache_manager import KVCacheManager
+
+    for name in ("allocate_slots", "can_fit_full_sequence"):
+        original = getattr(KVCacheManager, name, None)
+        if original is not None and not getattr(
+            original, "_ucm_end_prefix_private_allocation", False
+        ):
+            setattr(KVCacheManager, name, make_end_prefix_private_allocation(original))
 
 
 def limit_kvb_cache_writes(request, prefix_tokens):
@@ -518,6 +579,7 @@ class KVBRequestMeta(HLARequestMeta):
     end_prefix_save: EndPrefix | None = None
     end_prefix_load: EndPrefix | None = None
     end_prefix_resumed: bool = False
+    end_prefix_hbm_tokens: int = 0
 
 
 @dataclass
@@ -967,39 +1029,9 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
         self.chunk_end_token_ids.discard(None)
         self.chunk_end_token_ids.discard(-1)
         self.chunk_pad_token_id = padding.get("chunk_pad_token_id")
-        self.end_prefix_enabled = self.launch_config.get("kvb_end_prefix_cache", False)
         self._end_prefix_dispatch = {}
         self._end_prefix_waiting = {}
         self._end_prefix_results = {}
-        if self.end_prefix_enabled:
-            if current_platform.device_type != "npu":
-                raise ValueError("kvb_end_prefix_cache requires Ascend")
-            from vllm_ascend.utils import enable_sp, enable_sp_by_pass, vllm_version_is
-
-            parallel = vllm_config.parallel_config
-            if (
-                not vllm_version_is("0.19.1")
-                or not vllm_config.model_config.enforce_eager
-                or not self.hf_text_config.model_type.startswith("qwen3_5")
-                or vllm_config.cache_config.mamba_cache_mode != "all"
-                or vllm_config.speculative_config is not None
-                or vllm_config.cache_config.enable_prefix_caching
-                or parallel.pipeline_parallel_size != 1
-                or parallel.data_parallel_size != 1
-                or parallel.prefill_context_parallel_size != 1
-                or parallel.decode_context_parallel_size != 1
-                or parallel.enable_dbo
-                or enable_sp(vllm_config)
-                or enable_sp_by_pass()
-                or vllm_config.scheduler_config.async_scheduling
-                or vllm_config.scheduler_config.scheduler_cls is not None
-                or not self.chunk_end_token_ids
-            ):
-                raise ValueError(
-                    "kvb_end_prefix_cache requires Qwen3.5 on vLLM 0.19.1 with Ascend eager, the default synchronous "
-                    "scheduler, END tokens, and disabled native PC and speculative decoding. "
-                    "Only tensor parallelism is supported."
-                )
         self.kv_cluster_map = KVClusterMap(MAX_CLUSTER_NUM)
         self.kv_cache_layout_kvb = None
         self.kvb_denoised_states = {}
@@ -1014,16 +1046,16 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
 
         if role == KVConnectorRole.SCHEDULER:
             install_kvb_cache_write_policy()
-            if self.end_prefix_enabled:
-                install_end_prefix_recovery()
-                model = vllm_config.model_config
-                self._end_prefix_namespace = self.request_hasher((
-                    END_PREFIX_FORMAT, model.model, model.revision,
-                    self.hf_text_config.to_dict(),
-                    tuple((tuple(group.layer_names), repr(group.kv_cache_spec))
-                          for group in kv_cache_config.kv_cache_groups),
-                    tuple(tuple(tensor.shared_by) for tensor in kv_cache_config.kv_cache_tensors),
-                ))
+            install_end_prefix_recovery()
+            install_end_prefix_private_allocation()
+            model = vllm_config.model_config
+            self._end_prefix_namespace = self.request_hasher((
+                END_PREFIX_FORMAT, model.model, model.revision,
+                self.hf_text_config.to_dict(),
+                tuple((tuple(group.layer_names), repr(group.kv_cache_spec))
+                      for group in kv_cache_config.kv_cache_groups),
+                tuple(tuple(tensor.shared_by) for tensor in kv_cache_config.kv_cache_tensors),
+            ))
             self.group_manager = KVBHybridGroupManager(
                 kv_cache_config=kv_cache_config,
                 connector=self,
@@ -1031,6 +1063,11 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
             self.block_size = self.group_manager.block_size
             self.hash_block_size = self.group_manager.block_size
 
+        logger.info(
+            "KVB END initialized role=%s state=%s end_token_ids=%s",
+            role, "ready" if self.chunk_end_token_ids else "no_end_token_ids",
+            sorted(self.chunk_end_token_ids),
+        )
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """注册正常缓存，并建立 chunk 临时布局和 FP32 RoPE 修正缓存。"""
@@ -1059,10 +1096,7 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
         self.kv_cache_layout_kvb = KVCacheLayoutKVB(
             self.kv_cache_layout, self.kv_caches
         )
-        if (
-            getattr(self, "end_prefix_enabled", False)
-            and self.kv_cache_layout_kvb.buffers[0].shape[1] < END_PREFIX_COMMIT.size
-        ):
+        if self.kv_cache_layout_kvb.buffers[0].shape[1] < END_PREFIX_COMMIT.size:
             raise ValueError("KVB END commit record does not fit the registered store page")
         self.rotary_emb_3d = RotaryEmbedding3D.from_config(
             config=self.hf_text_config,
@@ -1090,6 +1124,9 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
         return hashes
 
     def _match_end_prefix(self, request, meta, hit_tokens):
+        if not self.chunk_end_token_ids:
+            logger.info("KVB END skip request=%s reason=no_end_token_ids", request.request_id)
+            return None
         params = getattr(request, "sampling_params", None)
         if (
             params is None or params.prompt_logprobs is not None
@@ -1099,26 +1136,51 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
             or getattr(request, "cache_salt", None)
             or getattr(request, "skip_reading_prefix_cache", False)
         ):
+            logger.info("KVB END skip request=%s reason=unsupported_request", request.request_id)
             return None
         points = list(end_prefixes(
             request.all_token_ids[:request.num_prompt_tokens], self.block_size,
             self.chunk_end_token_ids, self.request_hasher, self._end_prefix_namespace,
         ))
+        if not points:
+            logger.info("KVB END skip request=%s reason=no_end_token", request.request_id)
+            return None
         rejected_key = getattr(request, "_ucm_end_prefix_rejected_key", None)
-        if points and points[-1].tokens > hit_tokens and points[-1].key != rejected_key:
+        if points[-1].tokens > hit_tokens and points[-1].key != rejected_key:
             meta.end_prefix_save = points[-1]
+            block, offset = divmod(points[-1].tokens, self.block_size)
+            logger.info(
+                "KVB END save plan request=%s tokens=%d block=%d offset=%d",
+                request.request_id, points[-1].tokens, block, offset,
+            )
         if rejected_key is not None:
+            logger.info("KVB END skip request=%s reason=previous_load_failure", request.request_id)
             return None
         candidates = [point for point in reversed(points)
                       if hit_tokens < point.tokens < request.num_tokens]
         if not candidates:
+            logger.info(
+                "KVB END skip request=%s reason=covered_prefix_or_logits prefix_tokens=%d end_points=%d",
+                request.request_id, hit_tokens, len(points),
+            )
             return None
         try:
             hits = self.store.lookup([point.key for point in candidates])
         except Exception as exc:  # noqa: BLE001 - store backends raise different errors
             logger.warning("KVB END lookup failed request=%s error=%s", request.request_id, exc)
             return None
-        return next((point for point, hit in zip(candidates, hits) if hit), None)
+        point = next((point for point, hit in zip(candidates, hits) if hit), None)
+        if point is None:
+            logger.info(
+                "KVB END miss request=%s candidates=%d prefix_tokens=%d",
+                request.request_id, len(candidates), hit_tokens,
+            )
+        else:
+            logger.info(
+                "KVB END candidate request=%s tokens=%d awaiting_load=True",
+                request.request_id, point.tokens,
+            )
+        return point
 
     def generate_chunk_hash(self, token_ids):
         """仅按种子和 chunk 内容生成 hash，支持不同位置的内容匹配。"""
@@ -1186,11 +1248,14 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
 
     def get_num_new_matched_tokens(self, request, num_computed_tokens):
         """先查 prefix 再查 chunk，chunk 命中不增加返回给 scheduler 的命中数。"""
+        request._ucm_end_prefix_pending = None
+        request._ucm_end_prefix_resumed = False
         matched, async_load = super().get_num_new_matched_tokens(
             request, num_computed_tokens
         )
         meta = self.requests_meta.get(request.request_id)
         if meta is None:
+            logger.info("KVB END skip request=%s reason=no_prefix_metadata", request.request_id)
             return matched, async_load
         meta = KVBRequestMeta(
             **{
@@ -1201,10 +1266,17 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
         # 用扩展对象替换 HLA metadata，保留前缀命中和各组 block 信息。
         self.requests_meta[request.request_id] = meta
         meta.cache_write_limit = getattr(request, "_ucm_kvb_cache_write_limit", None)
-        if getattr(self, "end_prefix_enabled", False) and not async_load and not num_computed_tokens:
-            point = self._match_end_prefix(request, meta, matched)
+        if not async_load:
+            point = self._match_end_prefix(request, meta, num_computed_tokens + matched)
             if point is not None:
                 meta.end_prefix_load = point
+                meta.end_prefix_hbm_tokens = num_computed_tokens
+                request._ucm_end_prefix_pending = point
+        else:
+            logger.info(
+                "KVB END skip request=%s reason=existing_prefix_load hbm_tokens=%d async_load=%s",
+                request.request_id, num_computed_tokens, async_load,
+            )
         if not self.chunk_end_token_ids:
             return matched, async_load
         (meta.new_kv_cluster, meta.load_chunk_meta, meta.mamba_load_chunk_meta) = (
@@ -1215,7 +1287,7 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
             )
         )
         if meta.end_prefix_load is not None:
-            return meta.end_prefix_load.tokens, True
+            return meta.end_prefix_load.tokens - num_computed_tokens, True
         candidates = meta.load_chunk_meta + meta.mamba_load_chunk_meta
         if candidates:
             first_reuse = min(chunk.destination_start for chunk in candidates)
@@ -1351,8 +1423,9 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
         super().update_state_after_alloc(request, blocks, num_external_tokens)
         meta = self.requests_meta.get(request.request_id)
         point = getattr(meta, "end_prefix_load", None)
-        if point is not None and num_external_tokens == point.tokens:
+        if point is not None and num_external_tokens == point.tokens - meta.end_prefix_hbm_tokens:
             rid = request.request_id
+            request.num_external_computed_tokens = point.tokens
             self._end_prefix_waiting[rid] = request
             self._end_prefix_dispatch[rid] = KVBRequestDispatchMeta(
                 load_block_ids=([], []), dump_block_ids=([], []),
@@ -1366,16 +1439,23 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
         worker = getattr(connector_output, "kv_connector_worker_meta", None)
         for rid, loaded in getattr(worker, "end_prefix_loads", {}).items():
             request = self._end_prefix_waiting.pop(rid, None)
-            if request is None or request.is_finished():
+            if request is None:
+                continue
+            request._ucm_end_prefix_pending = None
+            if request.is_finished():
                 continue
             meta = self.requests_meta[rid]
             if loaded:
+                request._ucm_end_prefix_resumed = True
                 meta.token_processed = meta.end_prefix_load.tokens
                 meta.end_prefix_load = None
                 meta.end_prefix_resumed = True
                 meta.total_hit_block_num = meta.hbm_hit_block_num = 0
                 meta.cache_write_limit = limit_kvb_cache_writes(request, 0)
-                logger.info("KVB END hit request=%s tokens=%d", rid, meta.token_processed)
+                logger.info(
+                    "KVB END hit request=%s tokens=%d hbm_candidate_tokens=%d private_pages=True",
+                    rid, meta.token_processed, meta.end_prefix_hbm_tokens,
+                )
             else:
                 request._ucm_end_prefix_rejected_key = meta.end_prefix_load.key
                 request._ucm_end_prefix_load_failed = True
@@ -1398,7 +1478,7 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
             if outputs > 0 and isinstance(meta, KVBRequestMeta) and meta.cache_write_limit is None:
                 self.kv_cluster_map.insert_cluster(meta.new_kv_cluster)
         metadata = super().build_connector_meta(scheduler_output)
-        if getattr(self, "end_prefix_enabled", False):
+        if self._end_prefix_dispatch:
             metadata.request_meta.update(self._end_prefix_dispatch)
             self._end_prefix_dispatch.clear()
         return metadata
@@ -1683,8 +1763,6 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
 
     def wait_for_save(self):
         super().wait_for_save()
-        if not getattr(self, "end_prefix_enabled", False):
-            return
         context = self._kvb_fa_context
         metadata = self._get_connector_metadata()
         captured = getattr(context, "kvb_end_prefix_states", {})
@@ -1700,6 +1778,12 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
             failed = self._connector_worker_meta.load_failed_reqs
             ready = states.keys() == state_layers and rid not in failed
             if not self._get_tp_agreed_reuse_flags([ready])[0]:
+                logger.info(
+                    "KVB END save skipped request=%s tokens=%d reason=tp_state_not_ready "
+                    "tp_rank=%d local_ready=%s missing_layers=%s prefix_load_failed=%s",
+                    rid, point.tokens, self.tp_rank, ready,
+                    sorted(state_layers - states.keys()), rid in failed,
+                )
                 continue
             attempt = request.end_prefix_attempt
             try:
@@ -1708,7 +1792,13 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
             except Exception as exc:  # noqa: BLE001 - withhold the commit on any rank failure
                 logger.warning("KVB END data save failed request=%s error=%s", rid, exc)
                 ready = False
-            if not self._get_tp_agreed_reuse_flags([ready])[0] or self.tp_rank % self.tp_size:
+            if not self._get_tp_agreed_reuse_flags([ready])[0]:
+                logger.info(
+                    "KVB END save skipped request=%s tokens=%d reason=tp_data_write_failed tp_rank=%d",
+                    rid, point.tokens, self.tp_rank,
+                )
+                continue
+            if self.tp_rank % self.tp_size:
                 continue
             try:
                 data = END_PREFIX_COMMIT.pack(END_PREFIX_FORMAT, point.tokens, attempt)
@@ -1729,10 +1819,9 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
         if metadata is self._kvb_processed_metadata:
             return
         super().start_load_kv(forward_context, **kwargs)
-        if getattr(self, "end_prefix_enabled", False):
-            for rid, request in metadata.request_meta.items():
-                if getattr(request, "end_prefix_load", None) is not None:
-                    self._end_prefix_results[rid] = self._load_end_prefix(rid, request)
+        for rid, request in metadata.request_meta.items():
+            if getattr(request, "end_prefix_load", None) is not None:
+                self._end_prefix_results[rid] = self._load_end_prefix(rid, request)
         self._kvb_processed_metadata = metadata
         self.kvb_denoised_states.clear()
         if not hasattr(self, "kvb_cross_step_states"):
@@ -2458,14 +2547,12 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
         for rid in finished_req_ids:
             getattr(self, "kvb_cross_step_states", {}).pop(rid, None)
         sending, receiving = super().get_finished(finished_req_ids)
-        if getattr(self, "end_prefix_enabled", False) and self._end_prefix_results:
+        if self._end_prefix_results:
             receiving = set(receiving or ()) | self._end_prefix_results.keys()
         return sending, receiving
 
     def build_connector_worker_meta(self):
         meta = super().build_connector_worker_meta()
-        if not getattr(self, "end_prefix_enabled", False):
-            return meta
         results = self._end_prefix_results
         if meta is None and not results:
             return None
