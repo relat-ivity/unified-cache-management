@@ -1150,8 +1150,8 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
             meta.end_prefix_save = points[-1]
             block, offset = divmod(points[-1].tokens, self.block_size)
             logger.info(
-                "KVB END save plan request=%s tokens=%d block=%d offset=%d",
-                request.request_id, points[-1].tokens, block, offset,
+                "KVB END save plan request=%s tokens=%d block=%d offset=%d key=%s",
+                request.request_id, points[-1].tokens, block, offset, points[-1].key.hex(),
             )
         if rejected_key is not None:
             logger.info("KVB END skip request=%s reason=previous_load_failure", request.request_id)
@@ -1165,20 +1165,30 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
             )
             return None
         try:
-            hits = self.store.lookup([point.key for point in candidates])
+            # END candidates are independent snapshots, not consecutive blocks.
+            # Posix Lookup delegates to LookupOnPrefix and masks every key
+            # after the first miss. Query singletons so a new, unsaved END
+            # cannot hide an older committed snapshot in the same prompt.
+            point = next(
+                (candidate for candidate in candidates
+                 if self.store.lookup([candidate.key])[0]),
+                None,
+            )
         except Exception as exc:  # noqa: BLE001 - store backends raise different errors
             logger.warning("KVB END lookup failed request=%s error=%s", request.request_id, exc)
             return None
-        point = next((point for point, hit in zip(candidates, hits) if hit), None)
         if point is None:
             logger.info(
-                "KVB END miss request=%s candidates=%d prefix_tokens=%d",
+                "KVB END miss request=%s candidates=%d prefix_tokens=%d "
+                "namespace=%s queried_end_points=%s",
                 request.request_id, len(candidates), hit_tokens,
+                self._end_prefix_namespace.hex(),
+                [(candidate.tokens, candidate.key.hex()) for candidate in candidates],
             )
         else:
             logger.info(
-                "KVB END candidate request=%s tokens=%d awaiting_load=True",
-                request.request_id, point.tokens,
+                "KVB END candidate request=%s tokens=%d awaiting_load=True key=%s",
+                request.request_id, point.tokens, point.key.hex(),
             )
         return point
 
@@ -1447,14 +1457,17 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
             meta = self.requests_meta[rid]
             if loaded:
                 request._ucm_end_prefix_resumed = True
-                meta.token_processed = meta.end_prefix_load.tokens
+                point = meta.end_prefix_load
+                meta.token_processed = point.tokens
                 meta.end_prefix_load = None
                 meta.end_prefix_resumed = True
                 meta.total_hit_block_num = meta.hbm_hit_block_num = 0
                 meta.cache_write_limit = limit_kvb_cache_writes(request, 0)
                 logger.info(
-                    "KVB END hit request=%s tokens=%d hbm_candidate_tokens=%d private_pages=True",
+                    "KVB END hit request=%s tokens=%d hbm_candidate_tokens=%d private_pages=True "
+                    "block=%d offset=%d key=%s",
                     rid, meta.token_processed, meta.end_prefix_hbm_tokens,
+                    *divmod(point.tokens, self.block_size), point.key.hex(),
                 )
             else:
                 request._ucm_end_prefix_rejected_key = meta.end_prefix_load.key
@@ -1807,8 +1820,8 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
                 commit = self.kv_cache_layout_kvb.buffers[0][0, :len(data)]
                 commit.copy_(torch.tensor(list(data), dtype=torch.uint8))
                 self._end_prefix_io([point.key], write=True)
-                logger.info("KVB END saved request=%s tokens=%d bytes_per_rank=%d",
-                            rid, point.tokens, size)
+                logger.info("KVB END saved request=%s tokens=%d bytes_per_rank=%d key=%s",
+                            rid, point.tokens, size, point.key.hex())
             except Exception as exc:  # noqa: BLE001 - failed commits must not interrupt inference
                 logger.warning("KVB END commit save failed request=%s error=%s", rid, exc)
 
