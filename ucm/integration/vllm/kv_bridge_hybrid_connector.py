@@ -585,6 +585,9 @@ class KVBRequestMeta(HLARequestMeta):
 @dataclass
 class KVBRequestDispatchMeta(RequestDispatchMeta):
     """下发本 step 的复用范围、完整物理 block 表和下一步 FA 加载计划。"""
+    # Older UCM parents do not declare this flag. Own it here so END loads
+    # support both parent versions without changing the generic connector.
+    load_async: bool = field(default=False, kw_only=True)
     load_chunk_meta: list[LoadChunkMeta] = field(default_factory=list)
     mamba_load_chunk_meta: list[LoadChunkMeta] = field(default_factory=list)
     group_vllm_block_ids: list[list[int]] = field(default_factory=list)
