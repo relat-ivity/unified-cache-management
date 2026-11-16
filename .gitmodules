@@ -1,0 +1,4 @@
+[submodule "vllm-ascend"]
+	path = vllm-ascend
+	url = https://github.com/relat-ivity/vllm-ascend.git
+	branch = g_cache_all_mode
