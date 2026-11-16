@@ -1,11 +1,14 @@
 import math
 import struct
+import time
 from collections import OrderedDict, defaultdict
 from collections.abc import Callable
+from copy import copy
 from dataclasses import dataclass, field, replace
 from functools import wraps
 from inspect import signature
-from typing import ClassVar
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, ClassVar
 from uuid import uuid4
 
 import numpy as np
@@ -25,25 +28,36 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 
+from ucm.integration.vllm.device import create_device
 from ucm.integration.vllm.hla_connector import (
+    HLARequestDispatchMeta,
     HLARequestMeta,
     UCMHybridLinearAttentionConnector,
     block_size_from_kv_cache_spec,
+    extend_non_null,
     layer_name_to_kv_cache_spec,
 )
-from ucm.integration.vllm.ucm_connector import (
-    RequestDispatchMeta,
+from ucm.integration.vllm.request_hasher import (
     RequestHasher,
+    _request_has_extra_hash_semantics,
+)
+from ucm.integration.vllm.ucm_connector import (
     UCMDirectConnector,
     UCMWorkerMetadata,
     _record_counter,
+    _use_ucm_connector_cpu_affinity,
 )
 from ucm.logger import init_logger
+from ucm.shared.metrics import ucmmetrics
+
+if TYPE_CHECKING:
+    from vllm.v1.request import Request
 
 logger = init_logger(__name__)
 
 MIN_CHUNK_LEN = 512
 MAX_CLUSTER_NUM = 100000
+KVB_CACHE_FORMAT = b"UCM_KVB_ALL_V090"
 END_PREFIX_FORMAT = b"UCM_KVB_END_PREFIX_V1"
 END_PREFIX_COMMIT = struct.Struct(f"!{len(END_PREFIX_FORMAT)}sQ16s")
 END_PREFIX_LOAD_ADMISSION = 1
@@ -159,7 +173,6 @@ def limit_kvb_cache_writes(request, prefix_tokens):
 
 def install_kvb_cache_write_policy():
     """Limit PC registration in every cache group while retaining live blocks."""
-    # Scheduler-only import; workers do not need vLLM core here.
     from vllm.v1.core.single_type_kv_cache_manager import SingleTypeKVCacheManager
 
     original = SingleTypeKVCacheManager.cache_blocks
@@ -406,6 +419,81 @@ def kvb_replace_padding(prompt_token_ids: list[int], vllm_config: "VllmConfig"):
     return [token for chunk in chunks for token in chunk]
 
 
+class LegacyKVBLayout:
+    """Expose Ascend's component-major cache as group-aware direct store columns."""
+
+    def __init__(self, cache_config, kvcaches):
+        self.layer_name_to_group = {
+            name: gid
+            for gid, group in enumerate(cache_config.kv_cache_groups)
+            for name in group.layer_names
+        }
+        group_columns = defaultdict(set)
+        described_layers = set()
+        columns: dict[tuple[int, int], int] = {}
+        for descriptor in cache_config.kv_cache_tensors:
+            for name in descriptor.shared_by:
+                if name not in kvcaches:
+                    continue
+                group = self.layer_name_to_group[name]
+                for tensor in kvcaches[name]:
+                    item_size = tensor.element_size()
+                    stride = tensor.stride(0) * item_size
+                    address = tensor.data_ptr()
+                    storage = tensor.untyped_storage()
+                    if (
+                        tensor.shape[0] < cache_config.num_blocks
+                        or stride < math.prod(tensor.shape[1:]) * item_size
+                        or address + stride * cache_config.num_blocks
+                        > storage.data_ptr() + storage.nbytes()
+                    ):
+                        raise ValueError(
+                            f"Invalid KVB component-major cache for {name}"
+                        )
+                    column = columns.setdefault((address, stride), len(columns))
+                    group_columns[group].add(column)
+                described_layers.add(name)
+        if described_layers != kvcaches.keys() or not columns:
+            raise ValueError("KVB cache tensors are missing from the layer descriptors")
+        previous_end = 0
+        for address, stride in sorted(columns):
+            if address < previous_end:
+                raise ValueError(
+                    "KVB component-major cache has overlapping store columns"
+                )
+            previous_end = address + stride * cache_config.num_blocks
+
+        self.column_indices = columns
+        self.group_columns = {gid: sorted(cols) for gid, cols in group_columns.items()}
+        self.base_ptrs = np.asarray([addr for addr, _ in columns], dtype=np.uint64)
+        self.block_stride_lists = np.asarray(
+            [stride for _, stride in columns], dtype=np.uint64
+        )
+        self.buffer_sizes = self.block_stride_lists * cache_config.num_blocks
+        self.direct_group_bytes = {
+            gid: sum(int(self.block_stride_lists[col]) for col in group_columns)
+            for gid, group_columns in self.group_columns.items()
+        }
+
+    def direct_store_config(self):
+        sizes = self.block_stride_lists.tolist()
+        return sizes, sum(sizes), sum(sizes)
+
+    def extract_block_addrs(self, block_ids, group_ids):
+        if len(block_ids) != len(group_ids):
+            raise ValueError("KVB direct transfer requires one group ID per block")
+        ids = np.asarray(block_ids, dtype=np.uint64)
+        groups = np.asarray(group_ids, dtype=np.int64)
+        addrs = np.zeros((len(ids), len(self.base_ptrs)), dtype=np.uint64)
+        for gid in np.unique(groups):
+            rows = np.flatnonzero(groups == gid)
+            cols = self.group_columns[gid]
+            addrs[np.ix_(rows, cols)] = (
+                self.base_ptrs[cols] + ids[rows, None] * self.block_stride_lists[cols]
+            )
+        return addrs
+
+
 class KVCacheLayoutKVB:
     """沿用存储注册的字节布局，为 chunk 加载提供临时缓冲区。"""
 
@@ -421,62 +509,51 @@ class KVCacheLayoutKVB:
             break
         if self.device is None:
             raise ValueError("KVCacheLayoutKVB requires registered KV caches")
+        sizes, _, _ = layout.direct_store_config()
         self.buffers = [
             torch.empty(
-                (self.load_num_blocks, int(n)), dtype=torch.uint8, device=self.device
+                (self.load_num_blocks, size), dtype=torch.uint8, device=self.device
             )
-            for n in layout.tensor_size_lists
+            for size in sizes
         ]
+        self.base_ptrs = np.asarray(
+            [b.data_ptr() for b in self.buffers], dtype=np.uint64
+        )
+        self.sizes = np.asarray(sizes, dtype=np.uint64)
 
-    def extract_block_addrs(self, block_ids):
+    def extract_block_addrs(self, block_ids, group_id=None):
         """返回临时 block 各字节分段的地址，供存储加载使用。"""
-        ids = np.asarray(block_ids, dtype=np.uint64)
-        base = np.asarray([b.data_ptr() for b in self.buffers], dtype=np.uint64)
-        sizes = np.asarray([b.shape[1] for b in self.buffers], dtype=np.uint64)
-        return ids[:, None] * sizes[None, :] + base[None, :]
+        ids = np.asarray(block_ids, dtype=np.uint64)[:, None]
+        if group_id is None:
+            return ids * self.sizes + self.base_ptrs
+        cols = self.layout.group_columns[group_id]
+        addrs = np.zeros((len(ids), len(self.sizes)), dtype=np.uint64)
+        addrs[:, cols] = ids * self.sizes[cols] + self.base_ptrs[cols]
+        return addrs
 
-    def tensor_view(self, layer_name, tensor):
-        """根据注册张量的偏移和步长构造临时视图，首维必须是物理 block。"""
-        row = self.layout.row_slices[self.layout.layer_name_to_row[layer_name]]
-        for index in range(row.start, row.stop):
-            offset = tensor.data_ptr() - int(self.layout.base_ptrs[index])
-            size = self.buffers[index].shape[1]
-            item = tensor.element_size()
-            extent = (
-                1
-                + sum(
-                    (n - 1) * s for n, s in zip(tensor.shape[1:], tensor.stride()[1:])
-                )
-            ) * item
-            if offset < 0 or offset + extent > size:
-                continue
-            if size % item or offset % item:
-                continue
-            if tensor.shape[0] > 1 and tensor.stride(0) * item != int(
-                self.layout.block_stride_lists[index]
-            ):
-                continue
-            # 复用原张量的块内步长，首维改为临时布局的 block 步长。
-            raw = self.buffers[index].view(tensor.dtype)
-            return raw.as_strided(
-                (self.num_blocks, *tensor.shape[1:]),
-                (size // item, *tensor.stride()[1:]),
-                offset // item,
-            )
-        raise ValueError(f"{layer_name}: tensor is not described by the store layout")
+    def tensor_view(self, tensor):
+        """按活跃缓存分量的步长构造临时视图。"""
+        stride = tensor.stride(0) * tensor.element_size()
+        column = self.layout.column_indices.get((tensor.data_ptr(), stride))
+        if column is None:
+            raise ValueError("KVB tensor is missing from the store layout")
+        return self.buffers[column].view(tensor.dtype).as_strided(
+            (self.num_blocks, *tensor.shape[1:]), tensor.stride()
+        )
 
 
 class KVCluster:
     """记录一个请求的 chunk 索引及其有序内容标识。"""
+
     def __init__(
         self,
-        vllm_config: "VllmConfig",
+        request_hasher: RequestHasher,
         kvcluster_info: "KVClusterInfo",
         req_id="-1",
     ):
         """由请求的 chunk 信息创建 cluster，并记录来源请求 ID。"""
         self.kvcluster_info = kvcluster_info
-        self.request_hasher = RequestHasher(vllm_config, 0)
+        self.request_hasher = request_hasher
         self._seed = self.request_hasher("KV_BRIDGE_HASH_SEED")
         self.cluster_id = self._get_cluster_hash(kvcluster_info.chunk_hash_ids)
         self.request_id = req_id
@@ -583,11 +660,8 @@ class KVBRequestMeta(HLARequestMeta):
 
 
 @dataclass
-class KVBRequestDispatchMeta(RequestDispatchMeta):
+class KVBRequestDispatchMeta(HLARequestDispatchMeta):
     """下发本 step 的复用范围、完整物理 block 表和下一步 FA 加载计划。"""
-    # Older UCM parents do not declare this flag. Own it here so END loads
-    # support both parent versions without changing the generic connector.
-    load_async: bool = field(default=False, kw_only=True)
     load_chunk_meta: list[LoadChunkMeta] = field(default_factory=list)
     mamba_load_chunk_meta: list[LoadChunkMeta] = field(default_factory=list)
     group_vllm_block_ids: list[list[int]] = field(default_factory=list)
@@ -805,7 +879,10 @@ def _concrete_specs(spec: KVCacheSpec) -> list[KVCacheSpec]:
 def _is_full_attention_group(spec: KVCacheSpec) -> bool:
     """检查组内所有缓存规格是否均为 Full Attention。"""
     specs = _concrete_specs(spec)
-    return bool(specs) and all(isinstance(s, FullAttentionSpec) for s in specs)
+    return bool(specs) and all(
+        isinstance(s, FullAttentionSpec) and not isinstance(s, MLAAttentionSpec)
+        for s in specs
+    )
 
 
 def _is_mamba_all_group(spec: KVCacheSpec) -> bool:
@@ -825,6 +902,7 @@ class KVBHybridGroupInfo:
     layer_names: tuple[str, ...]
     seed: bytes
     is_mamba_all: bool
+    block_hasher: Callable[["Request"], list[bytes]]
 
     @property
     def is_full_attention(self) -> bool:
@@ -841,7 +919,6 @@ class KVBHybridGroupManager:
         connector: "UCMKvBridgeHybridConnector",
     ) -> None:
         """划分 FA 与 Mamba 组，并要求所有组使用相同 block 大小。"""
-        self.connector = connector
         request_hasher = connector.request_hasher
         base_seed = connector._seed
         self.groups_by_id: list[KVBHybridGroupInfo] = []
@@ -859,12 +936,15 @@ class KVBHybridGroupManager:
                     f"MambaSpec(mamba_cache_mode='all'); group={group_id}, spec={spec}"
                 )
 
+            block_size = block_size_from_kv_cache_spec(spec)
+            seed = request_hasher((KVB_CACHE_FORMAT, base_seed, group_id))
             info = KVBHybridGroupInfo(
                 group_id=group_id,
-                block_size=block_size_from_kv_cache_spec(spec),
+                block_size=block_size,
                 layer_names=tuple(group.layer_names),
-                seed=request_hasher((b"UCM_GROUP_SEED", base_seed, group_id)),
+                seed=seed,
                 is_mamba_all=is_mamba_all,
+                block_hasher=request_hasher.make_request_block_hasher(block_size, seed),
             )
             self.groups_by_id.append(info)
             if is_mamba_all:
@@ -892,18 +972,14 @@ class KVBHybridGroupManager:
         self.block_size = mamba_block_size
         self.lcm_block_size = self.block_size
 
-
     @property
     def num_groups(self) -> int:
         """返回缓存组数量，供 block 表和 dispatch 检查使用。"""
         return len(self.groups_by_id)
 
-    def compute_all_group_block_ids(self, token_ids) -> list[list[bytes]]:
-        """使用各组独立种子，为 token 序列生成所有组的存储 block hashes。"""
-        token_ids = getattr(token_ids, "all_token_ids", token_ids)
-        return [
-            self.connector.compute_block_hashes(g, token_ids) for g in self.groups_by_id
-        ]
+    def compute_all_group_block_ids(self, request: "Request") -> list[list[bytes]]:
+        """为各组生成包含请求语义的存储 block hashes。"""
+        return [group.block_hasher(request) for group in self.groups_by_id]
 
     def lookup_external_hit_tokens(
         self,
@@ -980,27 +1056,18 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
 
     @classmethod
     def supports_kv_cache_layout(cls, kv_cache_config) -> bool:
-        """检查支持的平台及 FA、all-mode Mamba 共享存储张量的布局。"""
-        if kv_cache_config is None:
+        """检查 Ascend 0.19.1 的 FA/Mamba all 共享缓存布局。"""
+        if kv_cache_config is None or current_platform.device_type != "npu":
             return False
-        if (
-            current_platform.device_type != "npu"
-            and not current_platform.is_cuda_alike()
-        ):
-            return False
-
         layer_to_specs = layer_name_to_kv_cache_spec(kv_cache_config)
-        for raw_tensor in kv_cache_config.kv_cache_tensors:
+        for descriptor in kv_cache_config.kv_cache_tensors:
             shared_specs = [
                 spec
-                for layer_name in raw_tensor.shared_by
-                for spec in layer_to_specs.get(layer_name, [])
+                for name in getattr(descriptor, "shared_by", ())
+                for spec in layer_to_specs.get(name, ())
             ]
-            if any(
-                isinstance(spec, FullAttentionSpec) for spec in shared_specs
-            ) and any(
-                isinstance(spec, MambaSpec) and spec.mamba_cache_mode == "all"
-                for spec in shared_specs
+            if any(_is_full_attention_group(s) for s in shared_specs) and any(
+                _is_mamba_all_group(s) for s in shared_specs
             ):
                 return True
         return False
@@ -1011,21 +1078,26 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
         role: KVConnectorRole,
         kv_cache_config: KVCacheConfig,
     ) -> None:
-        # 直接初始化公共传输实现，避免 HLA 构造函数建立 align-mode 管理器。
         """初始化 all-mode 传输、chunk 索引和 worker 跨步状态容器。"""
-        self.group_manager = None
-        UCMDirectConnector.__init__(
-            self,
-            vllm_config=vllm_config,
-            role=role,
-            kv_cache_config=kv_cache_config,
-        )
+        if not self.supports_kv_cache_layout(kv_cache_config):
+            raise ValueError(
+                "KVB requires the Ascend shared Full Attention and Mamba all-mode layout"
+            )
+        if role == KVConnectorRole.SCHEDULER:
+            # HLA's scheduler constructor uses an align-mode group manager.
+            UCMDirectConnector.__init__(self, vllm_config, role, kv_cache_config)
+            self.group_manager = KVBHybridGroupManager(kv_cache_config, self)
+            self.block_size = self.group_manager.lcm_block_size
+            self.hash_block_size = self.block_size
+        else:
+            super().__init__(vllm_config, role, kv_cache_config)
+            self.block_size = block_size_from_kv_cache_spec(
+                kv_cache_config.kv_cache_groups[0].kv_cache_spec
+            )
         self.max_model_len = vllm_config.model_config.max_model_len
         self.vllm_config = vllm_config
         self.hf_text_config = vllm_config.model_config.hf_text_config
 
-        # all-mode 的物理 block 0 有效，不能按 align-mode 空占位过滤。
-        self._skip_null_vllm_blocks = False
         padding = self.launch_config.get("padding_config") or {}
         end = padding.get("chunk_end_token_id", -1)
         self.chunk_end_token_ids = set(end if isinstance(end, (list, tuple)) else [end])
@@ -1047,28 +1119,33 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
         self.rotary_emb_3d = None
         self._kvb_processed_metadata = None
 
-        if role == KVConnectorRole.SCHEDULER:
+        if role == KVConnectorRole.SCHEDULER and self.chunk_end_token_ids:
             install_kvb_cache_write_policy()
             install_end_prefix_recovery()
             install_end_prefix_private_allocation()
             model = vllm_config.model_config
-            self._end_prefix_namespace = self.request_hasher((
-                END_PREFIX_FORMAT, model.model, model.revision,
-                self.hf_text_config.to_dict(),
-                tuple((tuple(group.layer_names), repr(group.kv_cache_spec))
-                      for group in kv_cache_config.kv_cache_groups),
-                tuple(tuple(tensor.shared_by) for tensor in kv_cache_config.kv_cache_tensors),
-            ))
-            self.group_manager = KVBHybridGroupManager(
-                kv_cache_config=kv_cache_config,
-                connector=self,
+            self._end_prefix_namespace = self.request_hasher(
+                (
+                    END_PREFIX_FORMAT,
+                    KVB_CACHE_FORMAT,
+                    model.model,
+                    model.revision,
+                    self.hf_text_config.to_dict(),
+                    tuple(
+                        (tuple(group.layer_names), repr(group.kv_cache_spec))
+                        for group in kv_cache_config.kv_cache_groups
+                    ),
+                    tuple(
+                        tuple(tensor.shared_by)
+                        for tensor in kv_cache_config.kv_cache_tensors
+                    ),
+                )
             )
-            self.block_size = self.group_manager.block_size
-            self.hash_block_size = self.group_manager.block_size
 
         logger.info(
             "KVB END initialized role=%s state=%s end_token_ids=%s",
-            role, "ready" if self.chunk_end_token_ids else "no_end_token_ids",
+            role,
+            "ready" if self.chunk_end_token_ids else "no_end_token_ids",
             sorted(self.chunk_end_token_ids),
         )
 
@@ -1095,12 +1172,39 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
                     raise ValueError(
                         f"Cannot register KVB Mamba layer {name}: {exc}"
                     ) from exc
-        super().register_kv_caches(normalized)
-        self.kv_cache_layout_kvb = KVCacheLayoutKVB(
-            self.kv_cache_layout, self.kv_caches
+        self.kv_caches = normalized
+        layout = self.kv_cache_layout = LegacyKVBLayout(
+            self._kv_cache_config, normalized
         )
-        if self.kv_cache_layout_kvb.buffers[0].shape[1] < END_PREFIX_COMMIT.size:
-            raise ValueError("KVB END commit record does not fit the registered store page")
+        self.device = create_device()
+        worker_cores, store_cores = (
+            self.device.split_cores(self.device_id)
+            if _use_ucm_connector_cpu_affinity()
+            else (None, None)
+        )
+        staging = self.kv_cache_layout_kvb = KVCacheLayoutKVB(layout, self.kv_caches)
+        if self.chunk_end_token_ids and staging.sizes[0] < END_PREFIX_COMMIT.size:
+            raise ValueError(
+                "KVB END commit record does not fit the registered store page"
+            )
+        tensor_sizes, shard_size, block_size = layout.direct_store_config()
+        self.block_data_size = shard_size
+        # Only store registration sees the additional staging buffers.
+        registration_layout = copy(layout)
+        registration_layout.base_ptrs = np.concatenate(
+            (layout.base_ptrs.reshape(-1), staging.base_ptrs)
+        )
+        registration_layout.buffer_sizes = np.concatenate(
+            (layout.buffer_sizes.reshape(-1), staging.sizes * staging.load_num_blocks)
+        )
+        self._create_store_bound(
+            registration_layout,
+            tensor_sizes,
+            shard_size,
+            block_size,
+            worker_cores,
+            store_cores,
+        )
         self.rotary_emb_3d = RotaryEmbedding3D.from_config(
             config=self.hf_text_config,
             head_dim=self.vllm_config.model_config.get_head_size(),
@@ -1108,35 +1212,29 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
             device=self.kv_cache_layout_kvb.device,
         )
 
-    def compute_block_hashes(
-        self, group: KVBHybridGroupInfo, token_ids: list[int]
-    ) -> list[bytes]:
-        """沿用 KVB token hash 链，使用当前缓存组的独立种子。"""
-        return self._hash_kvb_blocks(group.block_size, token_ids, group.seed)
-
     def _hash_kvb_blocks(self, block_size, token_ids, parent):
-        legacy = getattr(self, "generate_hash", None)
-        if legacy is not None:
-            return legacy(block_size, token_ids, parent)
-        hashes = []
-        for start in range(0, len(token_ids) - block_size + 1, block_size):
-            parent = self.request_hasher(
-                (parent, tuple(token_ids[start : start + block_size]))
-            )
-            hashes.append(parent)
-        return hashes
+        """从历史页继续 v0.9.0 的纯文本 block hash 链。"""
+        request = SimpleNamespace(
+            all_token_ids=token_ids,
+            mm_features=[],
+            lora_request=None,
+            cache_salt=None,
+            prompt_embeds=None,
+        )
+        return self.request_hasher.make_request_block_hasher(block_size, parent)(
+            request
+        )
 
     def _match_end_prefix(self, request, meta, hit_tokens):
         if not self.chunk_end_token_ids:
-            logger.info("KVB END skip request=%s reason=no_end_token_ids", request.request_id)
+            logger.info(
+                "KVB END skip request=%s reason=no_end_token_ids", request.request_id
+            )
             return None
         params = getattr(request, "sampling_params", None)
         if (
             params is None or params.prompt_logprobs is not None
-            or getattr(request, "mm_features", None)
-            or getattr(request, "lora_request", None) is not None
-            or getattr(request, "prompt_embeds", None) is not None
-            or getattr(request, "cache_salt", None)
+            or _request_has_extra_hash_semantics(request)
             or getattr(request, "skip_reading_prefix_cache", False)
         ):
             logger.info("KVB END skip request=%s reason=unsupported_request", request.request_id)
@@ -1246,12 +1344,14 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
 
     def get_kvbridge_matched_tokens(self, request, group_block_ids, prefix_hit_len):
         """构建当前 cluster，并与最佳历史 cluster 检查 FA、Mamba 命中。"""
+        if _request_has_extra_hash_semantics(request):
+            return None, [], []
         info, best_id = self._process_req(
             request.all_token_ids, group_block_ids, prefix_hit_len, request.request_id
         )
         if info is None:
             return None, [], []
-        cluster = KVCluster(self._vllm_config, info, request.request_id)
+        cluster = KVCluster(self.request_hasher, info, request.request_id)
         fa_hits, mamba_hits = [], []
         if best_id is not None:
             fa_hits, mamba_hits = self.get_hit_meta(
@@ -1263,6 +1363,7 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
         """先查 prefix 再查 chunk，chunk 命中不增加返回给 scheduler 的命中数。"""
         request._ucm_end_prefix_pending = None
         request._ucm_end_prefix_resumed = False
+        self.requests_meta.pop(request.request_id, None)
         matched, async_load = super().get_num_new_matched_tokens(
             request, num_computed_tokens
         )
@@ -1503,6 +1604,7 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
     def _append_block_range(
         dst_ucm_ids: list[bytes],
         dst_vllm_ids: list[int],
+        dst_group_ids: list[int],
         src_ucm_ids: list[bytes],
         src_vllm_ids: list[int],
         start_block: int,
@@ -1511,6 +1613,7 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
         request_id: str,
         group_id: int,
         reason: str,
+        skip_null_blocks: bool = False,
     ) -> None:
         """校验存储 hash 与物理 block 映射等长，再追加指定区间。"""
         if start_block >= end_block:
@@ -1530,9 +1633,14 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
                 f"ucm_blocks={len(ucm_slice)}, vllm_blocks={len(vllm_slice)}"
             )
 
-        # 物理 block 0 是有效缓存地址，不能在追加时过滤。
+        if skip_null_blocks:
+            extend_non_null(
+                dst_ucm_ids, dst_vllm_ids, dst_group_ids, ucm_slice, vllm_slice, group_id
+            )
+            return
         dst_ucm_ids.extend(ucm_slice)
         dst_vllm_ids.extend(vllm_slice)
+        dst_group_ids.extend([group_id] * len(ucm_slice))
 
     def _generate_hla_dispatch_meta(
         self,
@@ -1566,8 +1674,10 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
 
         load_ucm_ids: list[bytes] = []
         load_vllm_ids: list[int] = []
+        load_group_ids: list[int] = []
         dump_ucm_ids: list[bytes] = []
         dump_vllm_ids: list[int] = []
+        dump_group_ids: list[int] = []
 
         block_size = manager.block_size
         external_hit_lcm_blocks = (
@@ -1583,6 +1693,7 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
                 self._append_block_range(
                     load_ucm_ids,
                     load_vllm_ids,
+                    load_group_ids,
                     req_meta.group_ucm_block_ids[group.group_id],
                     req_meta.group_vllm_block_ids[group.group_id],
                     hbm_hit_tokens // group.block_size,
@@ -1597,6 +1708,7 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
                 self._append_block_range(
                     load_ucm_ids,
                     load_vllm_ids,
+                    load_group_ids,
                     req_meta.group_ucm_block_ids[group.group_id],
                     req_meta.group_vllm_block_ids[group.group_id],
                     hbm_hit_tokens // group.block_size,
@@ -1604,6 +1716,7 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
                     request_id=request_id,
                     group_id=group.group_id,
                     reason="load-mamba-all",
+                    skip_null_blocks=True,
                 )
 
         # 保存本步补齐的 blocks，末尾未完成的 block 留待后续 step。
@@ -1620,6 +1733,7 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
                 self._append_block_range(
                     dump_ucm_ids,
                     dump_vllm_ids,
+                    dump_group_ids,
                     req_meta.group_ucm_block_ids[group.group_id],
                     req_meta.group_vllm_block_ids[group.group_id],
                     dump_start // group.block_size,
@@ -1634,6 +1748,7 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
                 self._append_block_range(
                     dump_ucm_ids,
                     dump_vllm_ids,
+                    dump_group_ids,
                     req_meta.group_ucm_block_ids[group.group_id],
                     req_meta.group_vllm_block_ids[group.group_id],
                     dump_start // group.block_size,
@@ -1641,6 +1756,7 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
                     request_id=request_id,
                     group_id=group.group_id,
                     reason="dump-mamba-all",
+                    skip_null_blocks=True,
                 )
 
         step_start = req_meta.token_processed
@@ -1683,6 +1799,8 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
         return KVBRequestDispatchMeta(
             load_block_ids=(load_ucm_ids, load_vllm_ids),
             dump_block_ids=(dump_ucm_ids, dump_vllm_ids),
+            load_group_ids=load_group_ids,
+            dump_group_ids=dump_group_ids,
             load_chunk_meta=chunks,
             mamba_load_chunk_meta=mamba_chunks,
             group_vllm_block_ids=[list(ids) for ids in req_meta.group_vllm_block_ids],
@@ -1720,7 +1838,7 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
             is_fa = _is_full_attention_group(group.kv_cache_spec)
             for block in range(0 if is_fa else tail, tail + 1):
                 slot = table[block]
-                if not 0 <= slot < self._kv_cache_config.num_blocks:
+                if not 0 < slot < self._kv_cache_config.num_blocks:
                     raise ValueError("invalid KVB END physical slot")
                 key = self.request_hasher((point.key, attempt, gid, block))
                 length = min(size, point.tokens - block * size)
@@ -1737,7 +1855,7 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
             for index, (_, names, is_fa, slot, length) in enumerate(batch):
                 for name in names:
                     for component, tensor in enumerate(self.kv_caches[name][:2]):
-                        view = staging.tensor_view(name, tensor)[index]
+                        view = staging.tensor_view(tensor)[index]
                         if is_fa:
                             live = tensor[slot, :length]
                             view = view[:length]
@@ -1777,8 +1895,85 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
             logger.warning("KVB END data load failed request=%s error=%s", rid, exc)
         return self._get_tp_agreed_reuse_flags([ready])[0]
 
+    def _load_prefix(self, metadata):
+        """Use HLA's dispatch plan with the component-major address table."""
+        self._reset_transfer_state()
+        self._prepare_load_plan(metadata)
+        if not self.request_data:
+            return
+
+        self.device.synchronize()
+        start = time.perf_counter()
+        layout = self.kv_cache_layout
+        pending = []
+        for rid, keys, scoped, slots, groups in self.request_data:
+            try:
+                ptrs = layout.extract_block_addrs(slots, groups)
+                task = self._rank_consistency.submit_load(
+                    self.store, {rid: keys}, scoped, [0] * len(scoped), ptrs
+                )
+                pending.append((rid, task, groups))
+            except Exception as exc:  # noqa: BLE001 - mark store load failure for vLLM
+                self._mark_load_failed(metadata, rid)
+                logger.warning("KVB prefix load submission failed for %s: %s", rid, exc)
+
+        requests_loaded = blocks_loaded = bytes_loaded = 0
+        for rid, task, groups in pending:
+            try:
+                self._rank_consistency.wait_load(task)
+            except Exception as exc:  # noqa: BLE001 - wait for the remaining requests
+                self._mark_load_failed(metadata, rid)
+                logger.warning("KVB prefix load failed for %s: %s", rid, exc)
+                continue
+            requests_loaded += 1
+            blocks_loaded += len(groups)
+            bytes_loaded += sum(layout.direct_group_bytes[gid] for gid in groups)
+        duration_ms = (time.perf_counter() - start) * 1000
+        ucmmetrics.update_stats(
+            {
+                "load_requests_num": requests_loaded,
+                "load_blocks_num": blocks_loaded,
+                "load_duration": duration_ms,
+                "load_speed": bytes_loaded / max(duration_ms, 1) / 1024 / 1024,
+                "load_bytes_total": bytes_loaded,
+            }
+        )
+
+    def _save_prefix(self):
+        """Write component-major prefix pages using HLA's dump plan."""
+        keys, slots, groups, _, keys_by_request = self._ensure_dump_plan()
+        self._dump_plan = None
+        if not keys:
+            return
+
+        event = 0
+        layout = self.kv_cache_layout
+        start = time.perf_counter()
+        try:
+            ptrs = layout.extract_block_addrs(slots, groups)
+            event = self._get_dump_event_handle()
+            task = self._rank_consistency.submit_dump(
+                self.store, keys_by_request, keys, [0] * len(keys), ptrs, event
+            )
+            self._rank_consistency.wait_dump(task)
+        except Exception as exc:  # noqa: BLE001 - a failed dump is a future miss
+            logger.warning("KVB prefix dump failed: %s", exc)
+            return
+        finally:
+            if event:
+                self.device.destroy_event_handle(event)
+            self._rank_consistency.finish_dump(set(keys_by_request))
+        ucmmetrics.update_stats(
+            {
+                "save_duration": (time.perf_counter() - start) * 1000,
+                "save_bytes_total": sum(layout.direct_group_bytes[gid] for gid in groups),
+            }
+        )
+
     def wait_for_save(self):
-        super().wait_for_save()
+        if not self._connector_metadata:
+            return
+        self._save_prefix()
         context = self._kvb_fa_context
         metadata = self._get_connector_metadata()
         captured = getattr(context, "kvb_end_prefix_states", {})
@@ -1834,7 +2029,7 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
         # 同一个 dispatch 只处理一次，避免重复加载及重置临时状态。
         if metadata is self._kvb_processed_metadata:
             return
-        super().start_load_kv(forward_context, **kwargs)
+        self._load_prefix(metadata)
         for rid, request in metadata.request_meta.items():
             if getattr(request, "end_prefix_load", None) is not None:
                 self._end_prefix_results[rid] = self._load_end_prefix(rid, request)
@@ -1886,14 +2081,13 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
         for job in jobs:
             request_id, chunk_index, request, chunk, group, ids = job
             keys = list(group.block_ids)
-            # 普通 FA/GDN 各 TP rank 使用与保存端相同的分片哈希。
             scoped = (
                 keys
                 if self.tp_rank % self.tp_size == 0
                 else [self.request_hasher(key) for key in keys]
             )
             try:
-                ptrs = self.kv_cache_layout_kvb.extract_block_addrs(ids)
+                ptrs = self.kv_cache_layout_kvb.extract_block_addrs(ids, group.group_id)
                 task = self._rank_consistency.submit_load(
                     self.store, {request_id: keys}, scoped, [0] * len(scoped), ptrs
                 )
@@ -1976,8 +2170,8 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
                 raise ValueError("KVB destination outside allocated block table")
             offset = group.source_offset + chunk.output_offset
             staging = self.kv_cache_layout_kvb
-            temp_k = staging.tensor_view(name, key)[ids[0] : ids[-1] + 1]
-            temp_v = staging.tensor_view(name, value)[ids[0] : ids[-1] + 1]
+            temp_k = staging.tensor_view(key)[ids[0] : ids[-1] + 1]
+            temp_v = staging.tensor_view(value)[ids[0] : ids[-1] + 1]
             src_k = temp_k.reshape(-1, *key.shape[2:])[offset : offset + length]
             src_v = temp_v.reshape(-1, *value.shape[2:])[offset : offset + length]
             if src_k.shape[0] != length or src_v.shape[0] != length:
@@ -2009,10 +2203,10 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
         conv, state, g = get_mamba_state_views(
             self.kv_caches[name], group.block_size, self._kv_cache_config.num_blocks
         )
-        state_view = self.kv_cache_layout_kvb.tensor_view(name, state)[
+        state_view = self.kv_cache_layout_kvb.tensor_view(state)[
             ids[0] : ids[-1] + 1
         ]
-        g_view = self.kv_cache_layout_kvb.tensor_view(name, g)[ids[0] : ids[-1] + 1]
+        g_view = self.kv_cache_layout_kvb.tensor_view(g)[ids[0] : ids[-1] + 1]
         preceding = int(group.has_previous_state)
         initial = state_view[0] if preceding else None
         clean = denoise_gdn(state_view[preceding:], g_view[preceding:], initial)
@@ -2044,7 +2238,7 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
             s < 0 or s >= state.shape[0] for s in slots
         ):
             raise ValueError("GDN destination outside allocated block table")
-        conv_view = self.kv_cache_layout_kvb.tensor_view(name, conv)[
+        conv_view = self.kv_cache_layout_kvb.tensor_view(conv)[
             ids[0] : ids[-1] + 1
         ]
         # states 用于组合，source_states 用于非对齐槽位保存，g 按目标 token 写回。
