@@ -1,4 +1,3 @@
-import logging
 import math
 import os
 import struct
@@ -1364,18 +1363,9 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
         cluster = KVCluster(self.request_hasher, info, request.request_id)
         fa_hits, mamba_hits = [], []
         if best_id is not None:
-            source_cluster = self.kv_cluster_map.candidates[best_id]
             fa_hits, mamba_hits = self.get_hit_meta(
-                request, cluster, source_cluster
+                request, cluster, self.kv_cluster_map.candidates[best_id]
             )
-            if logger.isEnabledFor(logging.DEBUG):
-                logger.debug(
-                    "KVB chunk plan request=%s source_request=%s prefix_tokens=%d "
-                    "fa_ranges=%s gdn_ranges=%s (source_start,destination_start,length)",
-                    request.request_id, source_cluster.request_id, prefix_hit_len,
-                    [(hit.source_start, hit.destination_start, hit.length) for hit in fa_hits],
-                    [(hit.source_start, hit.destination_start, hit.length) for hit in mamba_hits],
-                )
         return cluster, fa_hits, mamba_hits
 
     def get_num_new_matched_tokens(self, request, num_computed_tokens):
@@ -1847,13 +1837,6 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
     def _transfer_end_prefix_pages(self, request, point, attempt, states=None):
         """Use the registered page layout and copy only live components."""
         write = states is not None
-        audit_dir = os.environ.get("UCM_KVB_END_AUDIT_DIR")
-        audit = audit_dir and os.environ.get("UCM_KVB_END_AUDIT_TOKENS") == str(point.tokens)
-        if audit:
-            from ucm.integration.vllm.kvb_end_audit import dump_end_tensors
-
-            if write:
-                dump_end_tensors(self, request, point, attempt, states, audit_dir)
         staging = self.kv_cache_layout_kvb
         pages = []
         for gid, group in enumerate(self._kv_cache_config.kv_cache_groups):
@@ -1893,8 +1876,6 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
             if write:
                 self._end_prefix_io(keys, write=True)
         self.device.synchronize()
-        if audit and not write:
-            dump_end_tensors(self, request, point, attempt, None, audit_dir)
         return len(pages) * self.block_data_size
 
     def _load_end_prefix(self, rid, request):
@@ -2471,12 +2452,6 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
             self._kvb_restored_cross_step_states[rid] = cross_step_state
             for name in names:
                 context.kvb_gdn_cross_step_inputs.setdefault(name, {})[rid] = cross_step_state
-            if context.kvb_reuse_log_rank == 0:
-                logger.debug(
-                    "KVB cross-step restore request=%s step=[%d,%d) "
-                    "state_tokens=%d carried_tokens=%d",
-                    rid, start, end, terminal, min(end, terminal) - start,
-                )
 
     def _prepare_reuse_masks_and_metadata(self, context, metadata, failed):
         """分别校验 FA 和 GDN 候选，发布复用 mask、分段数据及跨步记录。"""
@@ -2784,14 +2759,6 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
             offset = first - inputs["positions"][index]
             # mask 仅覆盖本步已调度 token，未来 token 不重复计入跳过数量。
             context.kvb_gdn_masks[index][offset : offset + last - first] = 1
-            step_start = inputs["positions"][index]
-            step_end = step_start + len(context.kvb_gdn_masks[index])
-            if last > step_end and context.kvb_reuse_log_rank == 0:
-                logger.debug(
-                    "KVB cross-step prepare request=%s step=[%d,%d) "
-                    "reuse=[%d,%d) carried_tokens=%d",
-                    rid, step_start, step_end, first, last, last - step_end,
-                )
             for name, span in payload.items():
                 if "next_step_state" in span:
                     self.kvb_cross_step_states[rid] = span["next_step_state"]
