@@ -725,7 +725,9 @@ def build_step_chunk_metadata(chunks, start, end, alignment, *, source_aligned=F
     return result
 
 
-def build_step_mamba_chunk_metadata(chunks, start, end, block_size, logits_limit):
+def build_step_mamba_chunk_metadata(
+    chunks, start, end, block_size, logits_limit, *, allow_unaligned_step=False,
+):
     """逐个生成与本 step 相交的完整源 block 描述，并保留跨步前缀。"""
     result = []
     for chunk in chunks:
@@ -733,9 +735,9 @@ def build_step_mamba_chunk_metadata(chunks, start, end, block_size, logits_limit
         first = max(0, (start - origin) // block_size)
         # 短 step 恰好到达已推进终点时仍保留前一块描述，以恢复尚未落池的状态。
         if (
-            origin % block_size
-            and start > origin
+            start > origin
             and (start - origin) % block_size == 0
+            and (origin % block_size or allow_unaligned_step)
         ):
             first -= 1
         stop = min(
@@ -747,6 +749,7 @@ def build_step_mamba_chunk_metadata(chunks, start, end, block_size, logits_limit
             # 保留 logits token；偏移 checkpoint 后须留下正常计算以保存续接状态。
             if last > logits_limit or (
                 target >= start
+                and not allow_unaligned_step
                 and end % block_size
                 and last >= end
             ):
@@ -1770,6 +1773,12 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
         step_start = req_meta.token_processed
         step_end = min(step_start + new_tokens, req_meta.num_token_ids)
         logits_limit = req_meta.num_token_ids - 1
+        end_prefix_resumed = req_meta.end_prefix_resumed and step_start < step_end
+        allow_unaligned_step = (
+            end_prefix_resumed
+            and req_meta.cache_write_limit is not None
+            and req_meta.cache_write_limit <= step_start
+        )
         chunks = build_step_chunk_metadata(
             getattr(req_meta, "load_chunk_meta", []),
             step_start, min(step_end, logits_limit), 1,
@@ -1780,6 +1789,7 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
             step_end,
             block_size,
             logits_limit,
+            allow_unaligned_step=allow_unaligned_step,
         )
         # GDN 提前组合时只预留超出本步的 K/V，不要求下一整个目标块。
         future_fa = []
@@ -1820,7 +1830,7 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
                 and step_end > max(step_start, req_meta.cache_write_limit)
             ),
             end_prefix_save=save_point,
-            end_prefix_resumed=req_meta.end_prefix_resumed and step_start < step_end,
+            end_prefix_resumed=end_prefix_resumed,
             end_prefix_attempt=uuid4().bytes if save_point is not None else b"",
         )
 
@@ -2626,6 +2636,12 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
                 future = None
                 # 保留现有 GDN 跨步协议，备齐超出本步的全部历史 K/V。
                 if valid and last > step_end:
+                    start = inputs["positions"][index]
+                    write_limit = getattr(request, "cache_write_limit", None)
+                    allow_unaligned_step = (
+                        getattr(request, "end_prefix_resumed", False)
+                        and write_limit is not None and write_limit <= start
+                    )
                     future_chunks = getattr(request, "fa_lookahead_chunk_meta", ())
                     future_start_index = fa_count + len(
                         getattr(request, "mamba_load_chunk_meta", ())
@@ -2641,7 +2657,7 @@ class UCMKvBridgeHybridConnector(UCMHybridLinearAttentionConnector):
                         ].layer_names
                     }
                     valid = (
-                        step_end % block_size == 0
+                        (step_end % block_size == 0 or allow_unaligned_step)
                         and last - step_end < block_size
                         and last <= inputs["prompt_lengths"][index] - 1
                         and future is not None
